@@ -50,7 +50,7 @@ plt.figure()
 plt.bar(x - width / 5 -  width / 10, unl_vbu,   width=width/5, label='VBU', color='#61DE45', edgecolor='black',  hatch='x')
 
 # F7D58B , 6BB7CA
-plt.bar( x -  width / 10, unl_mbu , width=width/5, label='TCU-S', color='#F7D58B', edgecolor='black', hatch='*')
+plt.bar( x -  width / 10, unl_mbu , width=width/5, label='ManiF-SMC', color='#F7D58B', edgecolor='black', hatch='*')
 
 
 plt.bar( x + width / 5 -  width / 10  , salun, width=width/5, label='SalUn', color='#C6B3D3', edgecolor='black', hatch='\\')

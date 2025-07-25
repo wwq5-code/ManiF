@@ -48,12 +48,12 @@ plt.plot(x, org_acc, linestyle='--', color='#9BC985',  marker='s', fillstyle='fu
 
 
 plt.plot(x, OUL, linestyle='-', color='#797BB7', marker='o', fillstyle='full', markevery=markevery,
-         label='R-MSE (TCU-S)', linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
+         label='R-MSE (ManiF-SMC)', linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
 
 
 
 
-plt.plot(x, OUL_t, linestyle='-.', color='#B595BF',  marker='d', fillstyle='full', markevery=markevery, label='T-MSE (TCU-S)',linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
+plt.plot(x, OUL_t, linestyle='-.', color='#B595BF',  marker='d', fillstyle='full', markevery=markevery, label='T-MSE (ManiF-SMC)',linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
 
 #
 #

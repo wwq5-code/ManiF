@@ -50,7 +50,7 @@ plt.figure()
 plt.bar(x - width / 5 -  width / 10, unl_vbu,   width=width/5, label='VBU', color='#61DE45', edgecolor='black',  hatch='x')
 
 # F7D58B , 6BB7CA
-plt.bar( x -  width / 10, unl_mbu , width=width/5, label='TCU', color='#F7D58B', edgecolor='black', hatch='*')
+plt.bar( x -  width / 10, unl_mbu , width=width/5, label='ManiF', color='#F7D58B', edgecolor='black', hatch='*')
 
 
 plt.bar( x + width / 5 -  width / 10  , salun, width=width/5, label='SalUn', color='#C6B3D3', edgecolor='black', hatch='\\')
@@ -60,7 +60,7 @@ plt.bar( x + width / 5 -  width / 10  , salun, width=width/5, label='SalUn', col
 plt.bar(x + width / 5 + width / 5 -  width / 10, unl_retrain, width=width/5, label='Retrain', color='#87B5B2', edgecolor='black', hatch='o')
 
 
-# plt.plot(x, OUL_finetuned, linestyle='-.', color='#E07E35',  marker='*', fillstyle='full', markevery=markevery, label='TCU(FineTuned)',linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
+# plt.plot(x, OUL_finetuned, linestyle='-.', color='#E07E35',  marker='*', fillstyle='full', markevery=markevery, label='ManiF(FineTuned)',linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
 
 
 #plt.bar(x + width / 6 + width / 6 + width/6  , unl_mib_CelebA,   width=width/6, label='MIB CelebA', color='#E58579', edgecolor='black', hatch='\\')

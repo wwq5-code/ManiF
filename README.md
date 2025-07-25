@@ -1,11 +1,11 @@
-# TCU-S
+# ManiF-SMC
 
 
 
-# Triplet Contrastive Unlearning with Self Mode Connectivity for Manifold Representation-based Unlearning
+# Manifold Forgetting with Self Mode Connectivity
 
 ## Overview
-This repository is the official implementation of TCU-S, and the corresponding paper is under review.
+This repository is the official implementation of ManiF-SMC, and the corresponding paper is under review.
 
 
 ## Prerequisites
@@ -38,7 +38,7 @@ On MNIST, USS = 200
 | VBU       | 57.00       | 99.37       | 99.15     | 0.201     | 
 | RFU       | 53.50    | 99.39    | 99.28      | 0.354      |  
 | SalUn       | 55.00    | 99.37    | 99.22      | 1.839      |  
-| TCU-S (Our)  | 61.50      | 99.57    | 99.14   | 1.483     |  
+| ManiF-SMC (Our)  | 61.50      | 99.57    | 99.14   | 1.483     |  
 
 In this table, we can achieve these metric values by running corresponding python files.
 

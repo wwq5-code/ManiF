@@ -1343,6 +1343,7 @@ def get_membership_inf_model(original_train_set, test_set, vib, args):
 
     return infer_model
 
+@torch.no_grad()
 def membership_inf_results(infer_model, vib, test_data_loader, state):
 
     # Initialize AUC metric

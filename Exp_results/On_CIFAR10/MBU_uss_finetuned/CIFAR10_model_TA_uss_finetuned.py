@@ -49,7 +49,7 @@ plt.plot(x, org_acc, linestyle='--', color='#9BC985',  marker='s', fillstyle='fu
 
 
 plt.plot(x, OUL, linestyle='-', color='#797BB7', marker='o', fillstyle='full', markevery=markevery,
-         label='TCU-S', linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
+         label='ManiF-SMC', linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
 
 
 plt.plot(x, salun_acc, linestyle='-.', color='#B595BF',  marker='d', fillstyle='full', markevery=markevery, label='SalUn',linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
@@ -57,7 +57,7 @@ plt.plot(x, salun_acc, linestyle='-.', color='#B595BF',  marker='d', fillstyle='
 plt.plot(x, vbu_ldp_acc, linestyle='-.', color='#E1C855',  marker='^', fillstyle='full', markevery=markevery,
          label='VBU',linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
 
-plt.plot(x, OUL_finetuned, linestyle='-.', color='#E07E35',  marker='*', fillstyle='full', markevery=markevery, label='TCU-S(FineTuned)',linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
+plt.plot(x, OUL_finetuned, linestyle='-.', color='#E07E35',  marker='*', fillstyle='full', markevery=markevery, label='ManiF-SMC(FineTuned)',linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
 
 
 
