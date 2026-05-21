@@ -42,17 +42,17 @@ On MNIST, USS = 200
 
 In this table, we can achieve these metric values by running corresponding python files.
 
-1. To run the TCU on MNIST, we can run
+1. To run the ManiF-SMC on MNIST, we can run
 ```
 python /Manifold_unl/On_MNIST/26Mar25/MNIST_Normal_distribution.py
 ```
 
-2. To run the TCU on CIFAR10, we can run
+2. To run the ManiF-SMC on CIFAR10, we can run
 ```
 python /Manifold_unl/On_CIFAR10/26Mar2025/CIFAR10_Normal_distribution.py
 ```
 
-3. To run the TCU on CelebA, we can run
+3. To run the ManiF-SMC on CelebA, we can run
 ```
 python /Manifold_unl/On_CelebA/18Apr2025/CELEBA_Normal_distribution_new.py
 ```
@@ -61,7 +61,7 @@ Note that, to sucessfully run the program on CelebA, we need first prepare the C
 (https://drive.google.com/drive/folders/0B7EVK8r0v71pWEZsZE9oNnFzTm8?resourcekey=0-5BR16BdXnb8hVj6CNHKzLg)
  
 
-4. To run the TCU on Tiny-ImageNet, we can run
+4. To run the ManiF-SMC on Tiny-ImageNet, we can run
 ```
 python /Manifold_unl/On_tiny_IMAGENET/IMAGEnet_Normal_distribution_new.py
 ```

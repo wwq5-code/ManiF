@@ -16,7 +16,7 @@ labels = ['200', '400', '600', '800', '1000', '1200']
 # unl_org = [97.77, 97.55, 97.35, 97.29, 97.21, 97.21]
 
 # unl_hess_r = [96.6, 96.66, 96.04, 95.94, 95.85, 97.21]
-OUL = [0.59032, 0.63032, 0.6700, 0.67842, 0.6940, 0.7633]
+OUL = [0.59032, 0.63072, 0.6698, 0.6788, 0.6947, 0.7633]
 
 OUL_finetuned = [0.55000, 0.55249, 0.53833, 0.57625, 0.56499, 0.58166]
 
@@ -35,7 +35,7 @@ for i in range(len(OUL)):
 
 
 plt.style.use('seaborn')
-plt.figure(figsize=(5.5, 5.3))
+plt.figure(figsize=(6.5, 5.0))
 l_w=5
 m_s=15
 marker_s = 3
@@ -61,12 +61,12 @@ plt.plot(x, salun_acc, linestyle='-.', color='#B595BF',  marker='d', fillstyle='
 plt.plot(x, vbu_ldp_acc, linestyle='-.', color='#E1C855',  marker='^', fillstyle='full', markevery=markevery,
          label='VBU',linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
 
-plt.plot(x, OUL_finetuned, linestyle='-.', color='#E07E35',  marker='*', fillstyle='full', markevery=markevery, label='ManiF-SMC(FineTuned)',linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
+plt.plot(x, OUL_finetuned, linestyle='-', color='#ED9F9B',  marker='v', fillstyle='full', markevery=markevery, label='ManiF-SMC(FineTuned)',linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
 
 
 
 # plt.grid()
-leg = plt.legend(fancybox=True, shadow=True)
+#leg = plt.legend(fancybox=True, shadow=True)
 # plt.xlabel('Malicious Client Ratio (%)' ,fontsize=16)
 plt.ylabel('MIA (%)' ,fontsize=24)
 my_y_ticks = np.arange(50., 81, 6)
@@ -81,7 +81,7 @@ plt.xticks(x, labels, fontsize=20)
 
 # plt.title('(c) Utility Preservation', fontsize=24)
 plt.legend(loc='best',          # same manual position
-           fontsize=20,               # same font size
+           fontsize=15,               # same font size
            ncol=1,
            columnspacing=1.,         # distance between the two columns
            handletextpad=0.8)         # gap between symbol and text

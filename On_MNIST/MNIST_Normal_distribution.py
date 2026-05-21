@@ -757,7 +757,7 @@ def vib_train(dataset, model, loss_fn, reconstruction_function, args, epoch, tra
         centroids = z.mean(dim=1)  # [B, d]
 
         # We want C = [d x B], so transpose:
-        C = centroids.transpose(0,1)  # [d, B]
+        C = centroids.transpose(0, 1)  # [d, B]
 
         # Compute nuclear norm of C
         # In newer PyTorch, we can use torch.linalg.svd
@@ -1320,10 +1320,8 @@ def membership_inf_results(infer_model, vib, test_data_loader, state):
     for x, y in test_data_loader:
         x, y = x.to(device), y.to(device).float()  # Ensure y is of type float for BCEWithLogitsLoss
 
-
         logits_z, logits_y, x_hat, mu, logvar = vib(x, mode='with_reconstruction')  # (B, C* h* w), (B, N, 10)
         y_pred = infer_model(logits_z).squeeze()  # Get predictions and squeeze to match y shape
-
 
         # Update AUC metric
         auroc.update(y_pred, y.int())
@@ -1360,12 +1358,12 @@ args.device = torch.device('cuda:{}'.format(args.gpu) if torch.cuda.is_available
 args.iid = True
 # args.model = 'z_linear'
 args.model = 'Normal'
-args.num_epochs = 1
+args.num_epochs = 5
 args.infer_training_e = 1
 args.dataset = 'MNIST'
 args.add_noise = False
-args.beta = 0.0001
-args.mcr_rate = 0.1
+args.beta = 0.1
+args.mcr_rate = 1
 args.classify_r = 0
 args.mse_rate = 0.1
 args.lr = 0.0005
@@ -1583,7 +1581,7 @@ plt.yticks(fontsize=20)
 
 plt.legend(fontsize=20)
 
-plt.savefig("Representation_with_MMCRs.png", dpi=300)  # Save with high resolution
+plt.savefig("Representation_with_MMCRs.pdf", dpi=300)  # Save with high resolution
 
 
 
@@ -1734,8 +1732,9 @@ plt.xticks(fontsize=20)
 plt.yticks(fontsize=20)
 
 plt.legend(fontsize=20)
+plt.show()
 
-plt.savefig("unl_Representation_with_MMCRs.png", dpi=300)  # Save with high resolution
+plt.savefig("unl_Representation_with_MMCRs.pdf", dpi=300)  # Save with high resolution
 
 
 

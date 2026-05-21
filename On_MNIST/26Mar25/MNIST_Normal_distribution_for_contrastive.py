@@ -18,7 +18,6 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap, BoundaryNorm
 import numpy as np
 from torch.utils.data import DataLoader, Dataset, Subset
 import copy
@@ -37,8 +36,6 @@ from torchmetrics.classification import BinaryAUROC, Accuracy
 
 from torch.nn.functional import pairwise_distance
 from collections import defaultdict
-import torchvision.models as M
-from torchvision.models.vision_transformer import VisionTransformer
 
 
 def args_parser():
@@ -679,53 +676,13 @@ class VIB(nn.Module):
     # definitions for spherical vae
 
 
-def make_vgg11bn_1ch_28(out_dim: int):
-    m = M.vgg11_bn(weights=None)
-    # first conv -> 1 channel
-    conv0 = m.features[0]
-    m.features[0] = nn.Conv2d(1, conv0.out_channels,
-                              kernel_size=conv0.kernel_size,
-                              stride=conv0.stride,
-                              padding=conv0.padding, bias=False)
-    # VGG downsamples 5 times; remove the last two MaxPools for 28×28
-    pool_idxs = [i for i, layer in enumerate(m.features) if isinstance(layer, nn.MaxPool2d)]
-    for idx in pool_idxs[-2:]:
-        m.features[idx] = nn.Identity()
-
-    # Replace big classifier with global pool + projection (512 ch at the end)
-    encoder = nn.Sequential(
-        m.features,
-        nn.AdaptiveAvgPool2d(1),
-        nn.Flatten(),
-        nn.Linear(512, out_dim)
-    )
-    return encoder
-
-def make_vit_b_28x28_patch4_1ch(out_dim: int):
-    vit = VisionTransformer(
-        image_size=28,      # <-- fixes the 224 check
-        patch_size=4,       # 28/4 = 7 tokens per side
-        num_layers=12,      # ViT-B
-        num_heads=12,
-        hidden_dim=768,
-        mlp_dim=3072,
-        dropout=0.0,
-        attention_dropout=0.0,
-        num_classes=out_dim  # out_dim = args.dimZ*2 (or args.dimZ for S-VAE)
-    )
-    # change patch embedding to 1 input channel
-    vit.conv_proj = nn.Conv2d(1, vit.conv_proj.out_channels, kernel_size=4, stride=4)
-    return vit
-
 def init_vib(args):
     if args.dataset == 'MNIST':
         approximator = LinearModel(n_feature=args.dimZ )
         decoder = LinearModel(n_feature=args.dimZ , n_output=28 * 28)
-
         if args.model == 'S-VAE':
             encoder = resnet18(1, args.dimZ)  # 64QAM needs 6 bits
         else:
-            # encoder = make_vit_b_28x28_patch4_1ch(out_dim=args.dimZ*2)
             encoder = resnet18(1, args.dimZ*2)  # 64QAM needs 6 bits
         lr = args.lr
 
@@ -761,107 +718,164 @@ def num_params(model):
 
 
 def vib_train(dataset, model, loss_fn, reconstruction_function, args, epoch, train_type):
+    """
+    train_type: "vib" (your original) or "contrastive"
+    args expects (for contrastive):
+        - tau (float): temperature for InfoNCE, e.g., 0.1
+        - contrastive_mode (str): "instance" (default) or "supervised"
+        - dimZ (int): embedding dim (already in your code)
+        - cls_weight (float, optional): if you want to add a small CE head loss in contrastive mode
+    """
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     for step, (x, y) in enumerate(dataset):
-        # views_x: [B, k, 1, 28, 28]
-        x = torch.stack(x, dim=1)  # ensure it's a tensor
-        y = torch.stack(y, dim=1)  # ensure it's a tensor
-        x, y = x.to(args.device), y.to(args.device)  # (B, C, H, W), (B, 10)
-
-        # Stack the k views along the batch dimension for encoding
-        # views_batch is a list of length k, each element is [B, 1, 28, 28]
-        # Actually, we defined __getitem__ differently: it returns a list of length k.
-        # After DataLoader, views_batch is [B, k, 1, 28, 28].
-        # Let's rearrange to handle all at once.
-        # shape: B x k x C x H x W -> (B*k, C, H, W)
+        # x: [B, k, C_in, H, W]  (each sample has k views)
+        # y: [B] or one-hot; below we reshape to [B*k] indices if available
+        x = torch.stack(x, dim=1)  # [B, k, C, H, W]
+        y = torch.stack(y, dim=1)  # try to stack; will reshape below
+        x, y = x.to(args.device), y.to(args.device)
 
         B, k, C_in, H, W = x.shape
-
         x = x.view(B * k, C_in, H, W)
-        y = y.view(B * k)
 
-        logits_z, logits_y, x_hat, mu, logvar = model(x, mode='with_reconstruction')  # (B, C* h* w), (B, N, 10)
-        # VAE two loss: KLD + MSE
+        if train_type.lower() == "contrastive":
+            # ---- Forward: get features z (projection) ----
+            # Prefer a lightweight "features" mode if your model supports it; otherwise fall back.
 
-        H_p_q = loss_fn(logits_y, y)
+            logits_z, logits_y, *_ = model(x, mode='with_reconstruction')
+            z = logits_z
 
-        KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar).cuda()
-        KLD = torch.sum(KLD_element).mul_(-0.5).cuda()
-        KLD_mean = torch.mean(KLD_element).mul_(-0.5).cuda()
+            # Normalize features
+            z = F.normalize(z, p=2, dim=1)  # [B*k, d]
 
-        x_hat = x_hat.view(x_hat.size(0), -1)
-        x = x.view(x.size(0), -1)
-        # mse loss for vae # torch.mean((x_hat - x) ** 2 * (x_inverse_m > 0).int()) / 0.75 # reconstruction_function(x_hat, x_inverse_m)  # mse loss for vae
-        BCE = reconstruction_function(x_hat, x)
-        # Calculate the L2-norm
+            # ------- Build positive sets --------
+            N = B * k
+            # Instance-positive mask: same underlying sample, different view
+            sample_ids = torch.arange(B, device=x.device).repeat_interleave(k)  # [B*k]
+            pos_mask_instance = (sample_ids.unsqueeze(0) == sample_ids.unsqueeze(1))  # [N, N]
+            eye = torch.eye(N, dtype=torch.bool, device=x.device)
+            pos_mask_instance = pos_mask_instance & (~eye)
 
-        # Normalize each embedding
-        z = F.normalize(logits_z, p=2, dim=1)  # [B*k, d]
+            # Supervised-positive mask (optional)
+            if getattr(args, "contrastive_mode", "instance") == "supervised":
+                # y could be one-hot or class indices; make indices
+                y_flat = y.view(B, k)
+                # If one-hot, convert to indices
+                if y_flat.ndim == 3 and y_flat.size(-1) > 1:
+                    y_idx = y_flat.argmax(dim=-1)  # [B, k]
+                else:
+                    y_idx = y_flat.squeeze(-1)     # [B, k] (class ids)
 
-        # Reshape back to [B, k, d]
-        z = z.view(B, k, args.dimZ)
+                y_idx = y_idx.reshape(-1)         # [B*k]
+                pos_mask_sup = (y_idx.unsqueeze(0) == y_idx.unsqueeze(1)) & (~eye)
+                pos_mask = pos_mask_sup
+            else:
+                pos_mask = pos_mask_instance
 
-        # Compute centroids: mean over k
-        centroids = z.mean(dim=1)  # [B, d]
+            # ------- InfoNCE with multi-positives (SimCLR-style) -------
+            # Cosine similarity matrix
+            sim = torch.matmul(z, z.t())  # [N, N], since z is L2-normalized
+            sim = sim / getattr(args, "tau", 0.1)
 
-        # We want C = [d x B], so transpose:
-        C = centroids.transpose(0, 1)  # [d, B]
+            # For numerical stability
+            sim_max, _ = sim.max(dim=1, keepdim=True)
+            sim_exp = torch.exp(sim - sim_max)
 
-        # Compute nuclear norm of C
-        # In newer PyTorch, we can use torch.linalg.svd
-        # S: singular values
-        U, S, V = torch.svd(C)  # or torch.linalg.svd(C), depending on PyTorch version
-        nuclear_norm = S.sum()
+            # Denominator: sum over all j != i
+            denom = (sim_exp * (~eye)).sum(dim=1)
 
-        # nuclear_norm = maximum_manifold_capacity(logits_z, gamma=0) + BCE
+            # Numerator: sum over positives
+            numer = (sim_exp * pos_mask).sum(dim=1)
 
-        loss = args.beta * KLD_mean + BCE + H_p_q - args.mcr_rate * nuclear_norm #  + H_p_q + H_p_q - nuclear_norm  + H_p_q + H_p_q + nuclear_norm
+            # Avoid log(0)
+            eps = 1e-12
+            loss_contrastive = -torch.log((numer + eps) / (denom + eps)).mean()
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5, norm_type=2.0, error_if_nonfinite=False)
-        # Check if gradients exist for x
-        # input_gradient = x.grad.detach()
-        optimizer.step()
+            # Optional: small supervised head (if your model returns logits_y here)
+            head_loss = 0.0
+            acc = float('nan')
+            if logits_y is not None and hasattr(args, "cls_weight") and args.cls_weight > 0:
+                # Build labels for each view (repeat class label across its k views)
+                y_flat = y.view(B, k)
+                if y_flat.ndim == 3 and y_flat.size(-1) > 1:
+                    y_idx = y_flat.argmax(dim=-1).reshape(-1)
+                else:
+                    y_idx = y_flat.squeeze(-1).reshape(-1)
+                head_loss = loss_fn(logits_y, y_idx)
+                loss = loss_contrastive + args.cls_weight * head_loss
+                acc = (logits_y.argmax(dim=1) == y_idx).float().mean().item()
+            else:
+                loss = loss_contrastive
 
-        acc = (logits_y.argmax(dim=1) == y).float().mean().item()
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5, norm_type=2.0, error_if_nonfinite=False)
+            optimizer.step()
 
-        # JS_p_q = 1 - js_div(logits_y.softmax(dim=1), y.softmax(dim=1)).mean().item()
-        metrics = {
-            'x.shape': x.shape[0],
-            'acc': acc,
-            'loss': loss.item(),
-            # 'BCE': BCE.item(),
-            # 'H(p,q)': H_p_q.item(),
-            # '1-JS(p,q)': JS_p_q,
-            'mu': torch.mean(mu).item(),
-            # 'kappa': torch.mean(kappa).item(),
-            'KLD_mean': KLD_mean.item(),
-        }
-        # if epoch == args.num_epochs - 1:
-        #     mu_list.append(torch.mean(mu).item())
-        #     sigma_list.append(sigma)
-        if step % len(dataset) % 10000 == 0:
-            print(f'[{epoch}/{0 + args.num_epochs}:{step % len(dataset):3d}] '
-                  + ', '.join([f'{k} {v:.3f}' for k, v in metrics.items()]))
-            x_cpu = x.cpu().data
-            x_cpu = x_cpu.clamp(0, 1)
-            x_cpu = x_cpu.view(x_cpu.size(0), 1, 28, 28)
-            grid = torchvision.utils.make_grid(x_cpu, nrow=4)
-            plt.imshow(np.transpose(grid, (1, 2, 0)))  # 交换维度，从GBR换成RGB
-            # plt.show()
+            metrics = {
+                'mode': 1.0,  # contrastive
+                'views': float(k),
+                'loss_contrastive': loss_contrastive.item(),
+            }
+            if not np.isnan(acc):
+                metrics['acc_head'] = acc
+            if step % len(dataset) % 10000 == 0:
+                print(f'[contrastive {epoch}/{0 + args.num_epochs}:{step % len(dataset):3d}] '
+                      + ', '.join([f'{k} {v:.3f}' for k, v in metrics.items()]))
 
-            x_hat_cpu = x_hat.cpu().data
-            x_hat_cpu = x_hat_cpu.clamp(0, 1)
-            x_hat_cpu = x_hat_cpu.view(x_hat_cpu.size(0), 1, 28, 28)
-            grid = torchvision.utils.make_grid(x_hat_cpu, nrow=4)
-            plt.imshow(np.transpose(grid, (1, 2, 0)))  # 交换维度，从GBR换成RGB
-            # plt.show()
-            # print("print x grad")
-            # print(input_gradient)
+        else:
+            # -------------------- Your original VIB path --------------------
+            # Reshape labels for CE
+            y = y.view(B * k)
+
+            logits_z, logits_y, x_hat, mu, logvar = model(x, mode='with_reconstruction')
+
+            H_p_q = loss_fn(logits_y, y)
+
+            KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar).to(args.device)
+            KLD_mean = torch.mean(KLD_element).mul_(-0.5)
+
+            x_hat = x_hat.view(x_hat.size(0), -1)
+            x_flat = x.view(x.size(0), -1)
+            BCE = reconstruction_function(x_hat, x_flat)
+
+            # Optionally compute nuclear norm (commented in your original)
+            # z = F.normalize(logits_z, p=2, dim=1).view(B, k, -1)
+            # centroids = z.mean(dim=1)  # [B, d]
+            # C = centroids.transpose(0, 1)  # [d, B]
+            # S = torch.linalg.svdvals(C)
+            # nuclear_norm = S.sum()
+
+            loss = args.beta * KLD_mean + BCE + H_p_q
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5, norm_type=2.0, error_if_nonfinite=False)
+            optimizer.step()
+
+            acc = (logits_y.argmax(dim=1) == y).float().mean().item()
+            metrics = {
+                'mode': 0.0,  # vib
+                'x.shape': x.shape[0],
+                'acc': acc,
+                'loss': loss.item(),
+                'KLD_mean': KLD_mean.item(),
+            }
+            if step % len(dataset) % 10000 == 0:
+                print(f'[vib {epoch}/{0 + args.num_epochs}:{step % len(dataset):3d}] '
+                      + ', '.join([f'{k} {v:.3f}' for k, v in metrics.items()]))
+
+                # (optional) quick visual checks
+                x_cpu = x_flat.view(x.size(0), 1, 28, 28).detach().cpu().clamp(0, 1)
+                grid = torchvision.utils.make_grid(x_cpu, nrow=4)
+                plt.imshow(np.transpose(grid, (1, 2, 0)))
+
+                x_hat_cpu = x_hat.view(x_hat.size(0), 1, 28, 28).detach().cpu().clamp(0, 1)
+                grid = torchvision.utils.make_grid(x_hat_cpu, nrow=4)
+                plt.imshow(np.transpose(grid, (1, 2, 0)))
 
     return model
+
 
 # here we prepare the unlearned model, and we can calculate the model difference
 def prepare_unl(erasing_dataset, dataloader_remaining_after_aux, model, loss_fn, args, noise_flag):
@@ -894,7 +908,7 @@ def prepare_unl(erasing_dataset, dataloader_remaining_after_aux, model, loss_fn,
             KLD_mean2 = torch.mean(KLD_element2).mul_(-0.5).to(args.device)
 
             loss = args.unlearn_learning_rate * (args.beta * KLD_mean - H_p_q) + args.self_sharing_rate * (
-                        args.beta * KLD_mean2 + H_p_q2)
+                        args.beta * KLD_mean2 + H_p_q2)  # args.beta * KLD_mean - H_p_q + args.beta * KLD_mean2  + H_p_q2 #- log_z / e_log_py #-   # H_p_q + args.beta * KLD_mean2
 
             optimizer.zero_grad()
             loss.backward()
@@ -1793,7 +1807,7 @@ def unlearning_with_topk(vib, unlearning_loader_with_center, top_k_nearest_loade
             x = x.view(x.size(0), -1)
             BCE = reconstruction_function(x_hat, x)
 
-            loss = 0.1  * (F.mse_loss(logits_z_p, center_z_new) -  F.mse_loss(logits_z, center_z_new) + alpha  + H_p_q ) #+ H_p_q # with label
+            loss = 0.2  * (F.mse_loss(logits_z_p, center_z_new) -  F.mse_loss(logits_z, center_z_new) + alpha  + H_p_q ) #+ H_p_q # with label
             # loss = 0.1 * (1.001 * F.cosine_similarity(logits_z, center_z_new, dim=-1).mean() * F.cosine_similarity(
             #     logits_z, center_z_new, dim=-1).mean() -
             #               F.cosine_similarity(logits_z_p, center_z_new, dim=-1).mean() * F.cosine_similarity(logits_z_p, center_z_new, dim=-1).mean() )
@@ -1917,11 +1931,12 @@ args.unlearn_learning_rate = 0.1
 args.ep_distance = 20
 args.dimZ =  32 #10 /2  # 40 # 2
 args.batch_size = 16
-args.unlearning_size = 400
+args.unlearning_size = 200
 args.erased_local_r = 0.02
 args.construct_size = 0.02
 # args.auxiliary_size = 0.01
-args.train_type = "MULTI"
+args.train_type = "contrastive"
+args.cls_weight = 1
 args.kld_to_org = 1
 args.unlearn_bce = 0.3
 
@@ -2046,7 +2061,7 @@ train_type = args.train_type
 start_time = time.time()
 for epoch in range(args.num_epochs):
     vib.train()
-    vib = vib_train(remaining_loader, vib, loss_fn, reconstruction_function, args, epoch, train_type)  # dataloader_total, dataloader_w_o_twin
+    vib = vib_train(train_loader, vib, loss_fn, reconstruction_function, args, epoch, train_type)  # dataloader_total, dataloader_w_o_twin
 
 
 print('acc list', clean_acc_list)
@@ -2068,6 +2083,7 @@ acc_t = eva_vib(vib, test_loader, args, name='on test dataset before unlearning'
 acc_r = eva_vib(vib, original_train_loader, args, name='on the remaining training before unlearning', epoch=999)
 
 
+
 acc_ua = eva_vib(vib, unlearning_loader, args, name='on the unlearning data before unlearning', epoch=999)
 print("acc_ua:", 1 - acc_ua)
 
@@ -2079,110 +2095,9 @@ infer_acc = membership_inf_results(infer_model, vib_for_infer, unl_infer_data_lo
 
 
 
-# unlearning_loader
-
-# train_loader
-
-
-@torch.no_grad()
-def collect_z(loader, vib, device, n_samples, is_multiview=False, view_idx=0, normalize=True):
-    vib.eval()
-    zs, ys = [], []
-    seen = 0
-
-    for batch in loader:
-        if is_multiview:
-            # train_loader (MultiViewMNIST): x_list is length k, each is [B,1,28,28]
-            x_list, y_list = batch
-            x = x_list[view_idx].to(device)
-            y = y_list[view_idx].to(device)
-        else:
-            # unlearning_loader: (x, y)
-            x, y = batch
-            x, y = x.to(device), y.to(device)
-
-        z, *_ = vib(x, mode='with_reconstruction')   # z == logits_z  (B, dimZ)
-        if normalize:
-            z = F.normalize(z, p=2, dim=1)
-
-        take = min(n_samples - seen, z.size(0))
-        zs.append(z[:take].cpu())
-        ys.append(y[:take].cpu())
-        seen += take
-
-        if seen >= n_samples:
-            break
-
-    return torch.cat(zs, dim=0), torch.cat(ys, dim=0)
-
-# 1) collect representations
-z_unl, y_unl = collect_z(unlearning_loader, vib, args.device, n_samples=200,  is_multiview=False)
-z_trn, y_trn = collect_z(remaining_loader,     vib, args.device, n_samples=4000, is_multiview=True, view_idx=0)
-
-# 2) t-SNE
-Z = torch.cat([z_trn, z_unl], dim=0).numpy()
-group = np.array([0] * len(z_trn) + [1] * len(z_unl))  # 0=train, 1=unlearning
-labels = torch.cat([y_trn, y_unl], dim=0).numpy()
-
-tsne = TSNE(
-    n_components=2,
-    perplexity=30,
-    init="pca",
-    learning_rate="auto",
-    random_state=0,
-)
-Z2 = tsne.fit_transform(Z)
-
-# 3) plot: train vs unlearning
-
-# tab10 in the exact order shown: 0..9
-cmap = ListedColormap(plt.cm.tab10.colors)
-bounds = np.arange(-0.5, 10.5, 1)          # [-0.5, 0.5, 1.5, ..., 9.5]
-norm = BoundaryNorm(bounds, cmap.N)
-
-fig, ax = plt.subplots(figsize=(7, 6))
-
-idx_tr = (group == 0)
-idx_un = (group == 1)
-
-ax.scatter(
-    Z2[idx_tr, 0], Z2[idx_tr, 1],
-    c=labels[idx_tr],
-    cmap=cmap, norm=norm,
-    s=6, alpha=0.35,
-    marker="o", linewidths=0,
-    label="Retrain"
-)
-
-ax.scatter(
-    Z2[idx_un, 0], Z2[idx_un, 1],
-    c=labels[idx_un],
-    cmap=cmap, norm=norm,
-    s=40, alpha=0.95,
-    marker="o", linewidths=0,
-    label="Unlearn"
-)
-
-ax.legend(loc="best", frameon=True)
-cb = fig.colorbar(ax.collections[-1], ax=ax, ticks=np.arange(10))  # attach to last scatter
-ax.set_title("Retrain - Random Unlearning: 10%")
-
-fig.tight_layout()
-
-# SAVE FIRST
-fig.savefig("Retrain_random_forgetting10p.pdf", dpi=300, bbox_inches="tight")
-#fig.savefig("Retrain_random_forgetting10p.png", dpi=300, bbox_inches="tight")  # optional
-
-plt.show()
-plt.close(fig)  # optional, frees memory
-
-
-
 
 # unlearning
 
-
-""""
 #unlearning_loader_with_c_p = prepare_centroid_and_positive(vib, unlearning_loader, remaining_loader, args)
 
 unlearning_with_new_center, top_k_nearest_loader = create_unlearning_with_topk_loader(vib, unlearning_loader, remaining_loader, args, top_k=5, shuffle=True)
@@ -2211,7 +2126,7 @@ acc_t = eva_vib(vib_unlearnined, test_loader, args, name='on test dataset after 
 acc_r = eva_vib(vib_unlearnined, original_train_loader, args, name='on the remaining training after unlearning', epoch=999)
 acc_ua = eva_vib(vib_unlearnined, unlearning_loader, args, name='on the unlearning data after unlearning', epoch=999)
 print("acc_ua:", 1 - acc_ua)
-"""
+
 
 
 

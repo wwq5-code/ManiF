@@ -11,14 +11,13 @@ import torch
 import torch.nn as nn
 import torch.optim
 import torchvision
-from torchvision.datasets import MNIST, CIFAR10, FashionMNIST, CIFAR100, CelebA
+from torchvision.datasets import MNIST, CIFAR10, FashionMNIST, CIFAR100
 from torch.utils.data import DataLoader, TensorDataset, random_split, ConcatDataset
 import torch.utils.data as Data
 import torch.nn.functional as F
 import torchvision.transforms as T
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap, BoundaryNorm
 import numpy as np
 from torch.utils.data import DataLoader, Dataset, Subset
 import copy
@@ -36,9 +35,7 @@ import torchmetrics
 from torchmetrics.classification import BinaryAUROC, Accuracy
 
 from torch.nn.functional import pairwise_distance
-from collections import defaultdict
-import torchvision.models as M
-from torchvision.models.vision_transformer import VisionTransformer
+
 
 
 def args_parser():
@@ -657,9 +654,9 @@ class VIB(nn.Module):
         B, dimZ = logits_z.shape
         logits_z = logits_z.reshape((B, -1))
         output_x = self.decoder(logits_z)
-        #x_v = x.view(x.size(0), -1)
-        #x2 = F.relu(x_v - output_x)
-        return torch.sigmoid(output_x)
+        x_v = x.view(x.size(0), -1)
+        x2 = F.relu(x_v - output_x)
+        return torch.sigmoid(self.fc3(x2))
 
     def cifar_recon(self, logits_z):
         # B, c, h, w = logits_z.shape
@@ -679,53 +676,13 @@ class VIB(nn.Module):
     # definitions for spherical vae
 
 
-def make_vgg11bn_1ch_28(out_dim: int):
-    m = M.vgg11_bn(weights=None)
-    # first conv -> 1 channel
-    conv0 = m.features[0]
-    m.features[0] = nn.Conv2d(1, conv0.out_channels,
-                              kernel_size=conv0.kernel_size,
-                              stride=conv0.stride,
-                              padding=conv0.padding, bias=False)
-    # VGG downsamples 5 times; remove the last two MaxPools for 28×28
-    pool_idxs = [i for i, layer in enumerate(m.features) if isinstance(layer, nn.MaxPool2d)]
-    for idx in pool_idxs[-2:]:
-        m.features[idx] = nn.Identity()
-
-    # Replace big classifier with global pool + projection (512 ch at the end)
-    encoder = nn.Sequential(
-        m.features,
-        nn.AdaptiveAvgPool2d(1),
-        nn.Flatten(),
-        nn.Linear(512, out_dim)
-    )
-    return encoder
-
-def make_vit_b_28x28_patch4_1ch(out_dim: int):
-    vit = VisionTransformer(
-        image_size=28,      # <-- fixes the 224 check
-        patch_size=4,       # 28/4 = 7 tokens per side
-        num_layers=12,      # ViT-B
-        num_heads=12,
-        hidden_dim=768,
-        mlp_dim=3072,
-        dropout=0.0,
-        attention_dropout=0.0,
-        num_classes=out_dim  # out_dim = args.dimZ*2 (or args.dimZ for S-VAE)
-    )
-    # change patch embedding to 1 input channel
-    vit.conv_proj = nn.Conv2d(1, vit.conv_proj.out_channels, kernel_size=4, stride=4)
-    return vit
-
 def init_vib(args):
     if args.dataset == 'MNIST':
         approximator = LinearModel(n_feature=args.dimZ )
         decoder = LinearModel(n_feature=args.dimZ , n_output=28 * 28)
-
         if args.model == 'S-VAE':
             encoder = resnet18(1, args.dimZ)  # 64QAM needs 6 bits
         else:
-            # encoder = make_vit_b_28x28_patch4_1ch(out_dim=args.dimZ*2)
             encoder = resnet18(1, args.dimZ*2)  # 64QAM needs 6 bits
         lr = args.lr
 
@@ -741,12 +698,6 @@ def init_vib(args):
         encoder = resnet18(3, args.dimZ * 2)  # resnet18(1, 49*2)
         decoder = LinearModel(n_feature=args.dimZ, n_output=3 * 32 * 32)
         lr = args.lr
-
-    # elif args.dataset == 'CelebA':
-    #     approximator = LinearModel(n_feature=args.dimZ, n_output=2)
-    #     encoder = resnet18(3, args.dimZ * 2)  # resnet18(1, 49*2)
-    #     decoder = Decoder() #LinearModel(n_feature=args.dimZ, n_output=3 * 32 * 32)
-    #     lr = args.lr
 
     vib = VIB(encoder, approximator, decoder)
     vib.to(args.device)
@@ -814,9 +765,9 @@ def vib_train(dataset, model, loss_fn, reconstruction_function, args, epoch, tra
         U, S, V = torch.svd(C)  # or torch.linalg.svd(C), depending on PyTorch version
         nuclear_norm = S.sum()
 
-        # nuclear_norm = maximum_manifold_capacity(logits_z, gamma=0) + BCE
+        # nuclear_norm = maximum_manifold_capacity(logits_z, gamma=0)
 
-        loss = args.beta * KLD_mean + BCE + H_p_q - args.mcr_rate * nuclear_norm #  + H_p_q + H_p_q - nuclear_norm  + H_p_q + H_p_q + nuclear_norm
+        loss = args.beta * KLD_mean + BCE + args.classify_r * H_p_q - args.mcr_rate * nuclear_norm #  + H_p_q + H_p_q - nuclear_norm  + H_p_q + H_p_q + nuclear_norm
 
         optimizer.zero_grad()
         loss.backward()
@@ -866,7 +817,7 @@ def vib_train(dataset, model, loss_fn, reconstruction_function, args, epoch, tra
 # here we prepare the unlearned model, and we can calculate the model difference
 def prepare_unl(erasing_dataset, dataloader_remaining_after_aux, model, loss_fn, args, noise_flag):
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    step = 0
+
     acc_test = []
     backdoor_acc_list = []
 
@@ -894,7 +845,7 @@ def prepare_unl(erasing_dataset, dataloader_remaining_after_aux, model, loss_fn,
             KLD_mean2 = torch.mean(KLD_element2).mul_(-0.5).to(args.device)
 
             loss = args.unlearn_learning_rate * (args.beta * KLD_mean - H_p_q) + args.self_sharing_rate * (
-                        args.beta * KLD_mean2 + H_p_q2)
+                        args.beta * KLD_mean2 + H_p_q2)  # args.beta * KLD_mean - H_p_q + args.beta * KLD_mean2  + H_p_q2 #- log_z / e_log_py #-   # H_p_q + args.beta * KLD_mean2
 
             optimizer.zero_grad()
             loss.backward()
@@ -1086,7 +1037,6 @@ def eva_vib(vib, dataloader_erase, args, name='test', epoch=999):
 
     num_total = 0
     num_correct = 0
-    MSE_total = 0
     for batch_idx, (x, y) in enumerate(dataloader_erase):
         x, y = x.to(args.device), y.to(args.device)  # (B, C, H, W), (B, 10)
         # x = x.view(x.size(0), -1)
@@ -1094,9 +1044,7 @@ def eva_vib(vib, dataloader_erase, args, name='test', epoch=999):
         logits_z, logits_y, x_hat, mu, logvar = vib(x, mode='with_reconstruction')  # (B, C* h* w), (B, N, 10)
 
         x_hat = x_hat.view(x_hat.size(0), -1)
-        x = x.view(x.size(0), -1)
-        BCE = reconstruction_function(x_hat, x)
-        MSE_total += BCE.item()
+
         if y.ndim == 2:
             y = y.argmax(dim=1)
         num_correct += (logits_y.argmax(dim=1) == y).sum().item()
@@ -1104,8 +1052,7 @@ def eva_vib(vib, dataloader_erase, args, name='test', epoch=999):
 
     acc = num_correct / num_total
     acc = round(acc, 5)
-    avg_mse = MSE_total / num_total
-    print(f'epoch {epoch}, {name} accuracy:  {acc:.4f}, total_num:{num_total}, avg_mse:{avg_mse}', x.shape)
+    print(f'epoch {epoch}, {name} accuracy:  {acc:.4f}, total_num:{num_total}', x.shape)
     return acc
 
 
@@ -1292,29 +1239,6 @@ class MultiViewMNIST(Dataset):
         labels = [label] * self.k
         return views, labels
 
-class MultiViewCIFAR(Dataset):
-    """
-    Provide k augmented views of CIFAR images.
-    """
-
-    def __init__(self, base_dataset, k, base_transform, aug_transform):
-        self.base_dataset = base_dataset
-        self.k = k
-        self.base_transform = base_transform
-        self.aug_transform = aug_transform
-
-    def __len__(self):
-        return len(self.base_dataset)
-
-    def __getitem__(self, idx):
-        img, label = self.base_dataset[idx]
-        # For each sample, produce k augmented views
-        views = [self.aug_transform(img) for _ in range(self.k)]
-        # Optionally, store label if needed
-        labels = [label] * self.k
-        return views, labels
-
-
 class CustomLabelDataset(Dataset):
     def __init__(self, dataset, label):
         self.dataset = dataset
@@ -1354,7 +1278,7 @@ def get_membership_inf_model(original_train_set, test_set, vib, args):
     accuracy = Accuracy(task='binary').to(device)
 
     # Training loop
-    num_epochs = args.infer_t_epochs
+    num_epochs = args.infer_training_e
     for epoch in range(num_epochs):
         infer_model.train()
         for x, y in data_loader:
@@ -1362,7 +1286,7 @@ def get_membership_inf_model(original_train_set, test_set, vib, args):
             optimizer_infer.zero_grad()
 
             logits_z, logits_y, x_hat, mu, logvar = vib(x, mode='with_reconstruction')  # (B, C* h* w), (B, N, 10)
-            y_pred = infer_model(logits_z.detach()).squeeze()  # Get predictions and squeeze to match y shape
+            y_pred = infer_model(logits_z).squeeze()  # Get predictions and squeeze to match y shape
 
             x = x.view(x.size(0), -1)
             # Compute the loss
@@ -1386,7 +1310,6 @@ def get_membership_inf_model(original_train_set, test_set, vib, args):
 
     return infer_model
 
-@torch.no_grad()
 def membership_inf_results(infer_model, vib, test_data_loader, state):
 
     # Initialize AUC metric
@@ -1418,471 +1341,6 @@ def membership_inf_results(infer_model, vib, test_data_loader, state):
     return epoch_auc.item()
 
 
-# Define distance function (e.g., Euclidean)
-def compute_distance(x, y):
-    return torch.norm(x - y, p=2, dim=1)
-
-
-# Define triplet loss function
-def triplet_loss(anchor, positive, negative, margin, dr):
-    dist_ap = compute_distance(anchor, positive)
-    dist_an = compute_distance(anchor, negative)
-    loss = dist_ap - dist_an + margin
-    return torch.clamp(loss * dr, min=0).mean()
-
-
-class UnlearningDatasetWithCentersAndPositives(torch.utils.data.Dataset):
-    def __init__(self, base_dataset, class_centers, all_embeddings, all_labels):
-        """
-        Args:
-            base_dataset: Dataset for unlearning (e.g., unlearning_loader.dataset)
-            class_centers: Dictionary with class centers {class_label: center_embedding}
-            all_embeddings: Tensor of all embeddings from the original train loader
-            all_labels: Tensor of all labels corresponding to all_embeddings
-        """
-        self.base_dataset = base_dataset
-        self.class_centers = class_centers
-        self.all_embeddings = all_embeddings
-        self.all_labels = all_labels
-
-    def __len__(self):
-        return len(self.base_dataset)
-
-    def __getitem__(self, idx):
-        # Get the original sample
-        x, y = self.base_dataset[idx]
-
-        # Ensure y is an integer (if it's already an int, this is a no-op)
-        if isinstance(y, torch.Tensor):
-            y = y.item()
-        # Get the corresponding class center
-        center_z = self.class_centers[y]
-
-        # Find positive samples from the same class
-        positive_indices = torch.where(self.all_labels == y)[0]
-        positive_idx = random.choice(positive_indices)  # Randomly choose a positive sample
-        positive_z = self.all_embeddings[positive_idx]
-
-        return x, y, center_z, positive_z
-
-def prepare_centroid_and_positive(vib, unlearning_loader, remaining_loader, args):
-    vib.eval()
-    all_embeddings = []
-    all_labels = []
-
-    with torch.no_grad():
-        for step, (images, labels) in enumerate(remaining_loader):
-            images = images.to(args.device)
-            labels = labels.to(args.device)
-            z, logits_y, x_hat, mu, logvar = vib(images, mode='with_reconstruction')  # (B, C* h* w), (B, N, 10)
-            z = F.normalize(z, p=2, dim=1)
-            all_embeddings.append(z.cuda())
-            all_labels.append(labels.cuda())
-            # print(z.shape)
-
-    # Combine embeddings and labels into single tensors
-    all_embeddings = torch.cat(all_embeddings, dim=0)  # [N, d]
-    all_labels = torch.cat(all_labels, dim=0)  # [N]
-
-    # Initialize a dictionary to store class centers
-    class_centers = {}
-
-    # Compute centers for each unique class
-    unique_classes = torch.unique(all_labels)
-    for cls in unique_classes:
-        class_mask = all_labels == cls  # Boolean mask for the current class
-        class_embeddings = all_embeddings[class_mask]  # Filter embeddings for the class
-        class_center = class_embeddings.mean(dim=0)  # Compute mean embedding for the class
-        class_centers[cls.item()] = class_center  # Store the center in the dictionary
-
-    # Print the centers for all classes
-    for cls, center in class_centers.items():
-        print(f"Class {cls}: Center shape: {center.shape}")
-
-    unlearning_dataset_with_c_p = UnlearningDatasetWithCentersAndPositives(
-        base_dataset=unlearning_loader.dataset,
-        class_centers=class_centers,
-        all_embeddings=all_embeddings,
-        all_labels=all_labels
-    )
-
-    unlearning_loader_with_c_p = DataLoader(unlearning_dataset_with_c_p, batch_size=args.batch_size, shuffle=True)
-
-    return unlearning_loader_with_c_p
-
-
-class UnlearningTopKDataset(Dataset):
-    def __init__(self, images, topk_centers, labels, positive_images):
-        """
-        images: list (or tensor) of shape [N, C, H, W]
-        topk_centers: list (or tensor) of shape [N, d]
-        labels: list (or tensor) of shape [N]
-        """
-        self.images = images
-        self.topk_centers = topk_centers
-        self.labels = labels
-        self.positive_images = positive_images
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, idx):
-        # Return (sample, topk_center, label)
-        return self.images[idx], self.topk_centers[idx], self.labels[idx], self.positive_images[idx]
-
-
-class TopKSamplesDataset(Dataset):
-    """
-    Each item:
-      (topk_images, center_z_new, topk_labels)
-    where:
-      topk_images:  [K, C, H, W]
-      center_z_new: [d]
-      topk_labels:  [K]
-    """
-    def __init__(self, all_topk_images, all_topk_labels, all_topk_centers):
-        self.topk_images = all_topk_images   # list or tensor of length M, each [K, C, H, W]
-        self.topk_labels = all_topk_labels   # list or tensor of length M, each [K]
-        self.topk_centers = all_topk_centers # shape [M, d] or list of length M
-
-    def __len__(self):
-        return len(self.topk_images)
-
-    def __getitem__(self, idx):
-        return (
-            self.topk_images[idx],   # shape [K, C, H, W]
-            self.topk_centers[idx],  # shape [d]
-            self.topk_labels[idx]    # shape [K]
-        )
-
-
-def create_unlearning_with_topk_loader(vib, unlearning_loader, remaining_loader, args, top_k=5, shuffle=True):
-    """
-    Returns a DataLoader whose batches yield tuples:
-        (unlearning_image, topk_center, label)
-    for each sample in unlearning_loader.
-    """
-
-    vib.eval()
-
-    # -------------------------------------------------
-    # 1) Gather all embeddings from the remaining_loader
-    # -------------------------------------------------
-    all_remaining_images_list = []
-    all_remaining_embeddings = []
-    all_remaining_labels = []
-    with torch.no_grad():
-        for step, (images, labels) in enumerate(remaining_loader):
-            images = images.to(args.device)
-            labels = labels.to(args.device)
-
-            z, logits_y, x_hat, mu, logvar = vib(images, mode='with_reconstruction')
-            # Normalize embeddings for consistent "nearest neighbor" measure
-            z = F.normalize(z, p=2, dim=1)
-
-            # Move to CPU to avoid large GPU memory usage
-            all_remaining_images_list.append(images.cpu())
-            all_remaining_embeddings.append(z.cpu())
-            all_remaining_labels.append(labels.cpu())
-
-    # Concatenate all the remaining embeddings into one tensor
-    all_remaining_images = torch.cat(all_remaining_images_list, dim=0).to(args.device)  # shape [N, C, H, W]
-    all_remaining_embeddings = torch.cat(all_remaining_embeddings, dim=0).to(args.device)  # [N, d]
-    all_remaining_labels = torch.cat(all_remaining_labels, dim=0).to(args.device)          # [N]
-
-    # -----------------------------------------------------
-    # 2) For each sample in unlearning_loader, find top-K
-    #    neighbors in 'all_remaining_embeddings', then store
-    #    (unlearning_image, topk_center, label)
-    # -----------------------------------------------------
-    unlearning_images_list = []
-    topk_centers_list = []
-    positive_images_list = []
-    unlearning_labels_list = []
-
-
-    # For the second dataset: top-K actual samples from the remaining set
-    all_topk_images_list  = []
-    all_topk_labels_list  = []
-    all_topk_centers_list = []
-
-
-    with torch.no_grad():
-        for step, (images, labels) in enumerate(unlearning_loader):
-            images = images.to(args.device)
-            labels = labels.to(args.device)
-
-            z_unlearn, logits_y, x_hat, mu, logvar = vib(images, mode='with_reconstruction')
-            z_unlearn = F.normalize(z_unlearn, p=2, dim=1)  # shape [B, d]
-
-            # Similarity of each unlearning embedding vs all remaining
-            sim = torch.mm(z_unlearn, all_remaining_embeddings.T)  # [B, N], dot product => cosine
-
-            # Indices of top-k most similar
-            _, topk_indices = torch.topk(sim, k=top_k, dim=1)
-
-            # For each sample in this batch...
-            for i in range(z_unlearn.size(0)):
-                # ----- (A) Gather top-K neighbors in "embedding space" -----
-                topk_idxs_i = topk_indices[i]  # shape [top_k]
-
-                # get top-k neighbors
-                neighbors = all_remaining_embeddings[topk_indices[i]]  # [top_k, d]
-                # shape [top_k, C, H, W]
-                neighbor_images    = all_remaining_images[topk_idxs_i]
-                # shape [top_k]
-                neighbor_labels    = all_remaining_labels[topk_idxs_i]
-
-                # center = mean of top-k neighbors
-                center_i = neighbors.mean(dim=0)  # [d]
-
-                # Store the original unlearning image, top-k center, label
-                # (move them to CPU or keep on GPU, depending on your pipeline)
-                unlearning_images_list.append(images[i].cpu())
-                topk_centers_list.append(center_i.cpu())
-                unlearning_labels_list.append(labels[i].cpu())
-                positive_images_list.append(neighbor_images[0].cpu())
-                # Instead of appending them all at once, do it one by one
-                for k_idx in range(len(topk_idxs_i)):
-                    # Single neighbor image, label
-                    one_neighbor_img = neighbor_images[k_idx]  # shape [C, H, W]
-                    one_neighbor_lbl = neighbor_labels[k_idx]  # scalar label
-
-                    # Append individually
-                    all_topk_images_list.append(one_neighbor_img.cpu())
-                    all_topk_labels_list.append(one_neighbor_lbl.cpu())
-
-                    # The center is the same for each neighbor in this top-k set
-                    all_topk_centers_list.append(center_i.cpu())
-
-
-    # -----------------------------------------------------
-    # 3) Create Dataset and DataLoader
-    # -----------------------------------------------------
-    # Turn lists into tensors (if desired) or keep them as lists
-    unlearning_images_tensor = torch.stack(unlearning_images_list, dim=0)  # [M, C, H, W]
-    topk_centers_tensor = torch.stack(topk_centers_list, dim=0)           # [M, d]
-    unlearning_labels_tensor = torch.stack(unlearning_labels_list, dim=0) # [M]
-    positive_images_tensor = torch.stack(positive_images_list, dim=0)  # [M, C, H, W]
-
-    dataset = UnlearningTopKDataset(
-        images=unlearning_images_tensor,
-        topk_centers=topk_centers_tensor,
-        labels=unlearning_labels_tensor,
-        positive_images=positive_images_tensor
-    )
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=shuffle)
-
-    topk_dataset = TopKSamplesDataset(
-        all_topk_images_list,
-        all_topk_labels_list,
-        torch.stack(all_topk_centers_list, dim=0)  # shape [M, d]
-    )
-
-    topk_samples_loader = DataLoader(
-        topk_dataset,
-        batch_size=args.batch_size,
-        shuffle=shuffle
-    )
-
-    return loader, topk_samples_loader
-
-
-def precompute_class_centers_with_logits(vib, remaining_loader, device):
-    """
-    1. 遍历 remaining_loader
-    2. 收集每个类别下的 logits_z
-    3. 计算类别中心
-    4. 返回:
-       class2center[c] = 该类别 logits_z 的中心向量
-       class2reps[c] = 该类别下所有 logits_z（后续随机挑选做 positive）
-    """
-    vib.eval()  # 如果你的 vib 有BN/Dropout，需要在推理时设置eval
-    class2reps = defaultdict(list)  # c -> list of logits_z
-
-    with torch.no_grad():
-        for images, labels in remaining_loader:
-            images = images.to(device)
-            labels = labels.to(device)
-
-            # 前向传播
-            logits_z, logits_y, _, mu, _ = vib(images, mode='with_reconstruction')
-            # 这里的 logits_z 就是你想要的表示 (batch_size, feature_dim)
-
-            for i, label in enumerate(labels):
-                class2reps[label.item()].append(logits_z[i])  # 逐个样本保存
-
-    # 计算中心
-    class2center = dict()
-    for c, rep_list in class2reps.items():
-        rep_tensor = torch.stack(rep_list, dim=0)  # [N, feature_dim]
-        center = rep_tensor.mean(dim=0)  # [feature_dim]
-        class2center[c] = center
-
-    return class2center, class2reps
-
-
-def find_center_and_positive(y, class2center, class2reps):
-    """
-    输入:
-      y: [batch_size], 当前批次样本的标签 (tensor)
-      class2center: dict, c -> center logits_z (tensor)
-      class2reps: dict, c -> list of logits_z (tensor)
-    输出:
-      center_z: [batch_size, feature_dim], 对应各标签的中心向量
-      positive_z: [batch_size, feature_dim], 随机选的同类表示
-    """
-    center_list = []
-    positive_list = []
-
-    for label in y:
-        label_int = label.item()
-        center_list.append(class2center[label_int])  # 中心向量
-        # 随机选一个同类样本
-        pos_rep = random.choice(class2reps[label_int])
-        positive_list.append(pos_rep)
-
-    # 拼成一个 batch
-    center_z = torch.stack(center_list, dim=0)
-    positive_z = torch.stack(positive_list, dim=0)
-    return center_z, positive_z
-
-def linear_interpolate(model_a, model_b, t=0.5):
-    """
-    Returns a *new* model whose parameters are an alpha‐interpolation of
-    model_a and model_b, i.e.  param_new = (1 - alpha)*param_a + alpha*param_b.
-    """
-    new_model = copy.deepcopy(model_a)
-    with torch.no_grad():
-        for p_a, p_b, p_new in zip(model_a.parameters(),
-                                   model_b.parameters(),
-                                   new_model.parameters()):
-            p_new.data = (1.0 - t) * p_a.data + t * p_b.data
-    return new_model
-
-def connect_determined_alpha(model_a, x, positive_x, center_z_new, args):
-
-    alpha = 0
-    vib_c, lr = init_vib(args)
-    vib_c.to(args.device)
-    connected_m = linear_interpolate(model_a, vib_c, args.t)
-    with torch.no_grad():
-        logits_z, logits_y, _, mu, _ = connected_m(x, mode='with_reconstruction')
-        logits_z_p, logits_y_p, _, mu_p, _ = connected_m(positive_x, mode='with_reconstruction')
-        alpha =   F.mse_loss(logits_z, center_z_new) - F.mse_loss(logits_z_p, center_z_new)
-
-    return alpha
-
-
-
-def unlearning_with_topk(vib, unlearning_loader_with_center, top_k_nearest_loader, loss_fn, reconstruction_function, args):
-    optimizer = torch.optim.Adam(vib.parameters(), lr=args.lr)
-    vib.train()
-    for epoch in range(args.unl_epochs):
-        epoch_loss = 0
-
-        for x, center_z_new, y, positive_x in unlearning_loader_with_center:
-            x, center_z_new,  y , positive_x = x.to(args.device), center_z_new.to(args.device), y.to(args.device), positive_x.to(args.device)
-            logits_z, logits_y, x_hat, mu, _ = vib(x, mode='with_reconstruction')
-            logits_z_p, logits_y_p, _, mu_p, _ = vib(positive_x, mode='with_reconstruction')
-
-            H_p_q = loss_fn(logits_y_p, y)
-            alpha = connect_determined_alpha(copy.deepcopy(vib), x, positive_x, center_z_new, args)
-
-            x_hat = x_hat.view(x_hat.size(0), -1)
-            x = x.view(x.size(0), -1)
-            BCE = reconstruction_function(x_hat, x)
-
-            loss = 0.1  * (F.mse_loss(logits_z_p, center_z_new) -  F.mse_loss(logits_z, center_z_new) + alpha  + H_p_q ) #+ H_p_q # with label
-            # loss = 0.1 * (1.001 * F.cosine_similarity(logits_z, center_z_new, dim=-1).mean() * F.cosine_similarity(
-            #     logits_z, center_z_new, dim=-1).mean() -
-            #               F.cosine_similarity(logits_z_p, center_z_new, dim=-1).mean() * F.cosine_similarity(logits_z_p, center_z_new, dim=-1).mean() )
-
-            # loss = torch.clamp(loss, min=0).mean()
-
-            # similarity_loss_positive = 1 - F.cosine_similarity(logits_z_p, center_z_new, dim=-1).mean()
-            # similarity_loss_negative = 1 - F.cosine_similarity(logits_z, center_z_new, dim=-1).mean()
-            #
-            # #buffer = F.mse_loss(logits_z_p, center_z_new) - F.mse_loss(logits_z, center_z_new)
-            # buffer = similarity_loss_positive - similarity_loss_negative
-            #
-            # loss = 0.1 * (similarity_loss_positive - similarity_loss_negative - similarity_loss_negative + torch.sqrt(buffer * buffer) + H_p_q )
-
-            loss = torch.clamp(loss, min=0).mean()
-
-            epoch_loss += loss.item()
-
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        print(f"Epoch {epoch + 1}/{args.unl_epochs}, Loss: {epoch_loss:.4f}, H_p_q:{H_p_q.item()}, BCE:{BCE.item()}, alpha:{alpha.item()}")
-
-        # for x, center_z_new, y in top_k_nearest_loader:
-        #     x, center_z_new,  y = x.to(args.device), center_z_new.to(args.device), y.to(args.device)
-        #     logits_z, logits_y, _, mu, _ = vib(x, mode='with_reconstruction')
-        #
-        #     loss = F.mse_loss(logits_z, center_z_new)
-        #     epoch_loss += loss.item()
-        #
-        #     # Backward pass
-        #     optimizer.zero_grad()
-        #     loss.backward()
-        #     optimizer.step()
-        #
-        # print(f"Epoch {epoch + 1}/{args.unl_epochs}, Loss: {epoch_loss:.4f}")
-
-
-    return vib
-
-# Triplet contrastive unlearning
-def triplet_contrastive_unlearning(vib, unlearning_loader, remaining_loader, margin, epochs, loss_fn, args):
-    optimizer = torch.optim.Adam(vib.parameters(), lr=args.lr)
-
-
-    for epoch in range(epochs):
-        vib.train()
-        epoch_loss = 0
-        #zip(erasing_dataset, dataloader_remaining_after_aux)
-        #for step, (x, y) in enumerate(unlearning_loader):
-        for (x_e, y_e), (x_r, y_r) in zip(unlearning_loader, remaining_loader):
-            x_e, y_e = x_e.to(args.device), y_e.to(args.device)
-            x_r, y_r = x_r.to(args.device), y_r.to(args.device)
-            logits_z_e, logits_y_e, _, mu_e, _ = vib(x_e, mode='with_reconstruction')
-            logits_z_r, logits_y_r, _, mu_r, _ = vib(x_r, mode='with_reconstruction')
-
-            class2center, class2reps = precompute_class_centers_with_logits(
-                vib, remaining_loader, device=args.device
-            )
-            center_z, positive_z = find_center_and_positive(y_e, class2center, class2reps)
-            H_p_q_r = loss_fn(logits_y_r, y_r)
-            # Compute loss
-            loss = triplet_loss(logits_z_e, center_z, positive_z, margin, args.distance_rate)  #+ H_p_q_r
-            epoch_loss += loss.item()
-
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        print(f"Epoch {epoch + 1}/{epochs}, Loss: {epoch_loss:.4f}")
-
-    return vib
-
-
-
-class TransformSubset(Subset):
-    def __init__(self, dataset, indices, transform=None):
-        super().__init__(dataset, indices)
-        self.transform = transform
-
-    def __getitem__(self, idx):
-        image, label = super().__getitem__(idx)  # Get the original image and label
-        if self.transform:
-            image = self.transform(image)  # Apply transformation to the image
-        return image, label
-
 
 seed = 0
 torch.cuda.manual_seed_all(seed)
@@ -1903,34 +1361,29 @@ args.iid = True
 # args.model = 'z_linear'
 args.model = 'Normal'
 args.num_epochs = 5
-args.unl_epochs = 1
-args.infer_t_epochs = 1
+args.infer_training_e = 1
 args.dataset = 'MNIST'
 args.add_noise = False
-args.beta = 0.0001 #1 #0.0001
-args.mcr_rate = 0.001 #0   # 0.0001
+args.beta = 0.1
+args.mcr_rate = 1
+args.classify_r = 0
 args.mse_rate = 0.1
 args.lr = 0.0005
-args.distance_rate = 0.0001
-args.margin = 0.001
 args.unlearn_learning_rate = 0.1
 args.ep_distance = 20
-args.dimZ =  32 #10 /2  # 40 # 2
+args.dimZ =  5 #10 /2  # 40 # 2
 args.batch_size = 16
-args.unlearning_size = 400
 args.erased_local_r = 0.02
 args.construct_size = 0.02
 # args.auxiliary_size = 0.01
 args.train_type = "MULTI"
 args.kld_to_org = 1
 args.unlearn_bce = 0.3
-
 args.self_sharing_rate = 0.8
 args.laplace_scale = 1
 args.laplace_epsilon = 10
 args.num_epochs_recon = 50
 args.k = 2 # number of augmentations per sample
-args.t = 0.5
 
 ### 1: 0.000017, 20: 0.00034, 40: 0.00067, 60: 0.001, 80: 0.00134, 100: 0.00167
 # print('args.beta', args.beta, 'args.lr', args.lr)
@@ -1945,8 +1398,8 @@ if args.dataset == 'MNIST':
         T.ToTensor()
         # transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
-
     trans_mnist = transforms.Compose([transforms.ToTensor(), ])
+
     # Base transforms (convert to tensor and normalize)
     base_transform = transforms.Compose([
         transforms.ToTensor(),
@@ -1961,58 +1414,21 @@ if args.dataset == 'MNIST':
     ])
     train_set = MNIST('../data/mnist', train=True, transform=None, download=True)
     test_set = MNIST('../data/mnist', train=False, transform=base_transform, download=True)
-    multi_view_dataset = MultiViewMNIST(train_set, args.k, base_transform, base_transform)
+    multi_view_dataset = MultiViewMNIST(train_set, args.k, base_transform, augmentation_transform)
     original_train_set = MNIST('../data/mnist', train=True, transform=base_transform, download=True)
 
 elif args.dataset == 'CIFAR10':
     train_transform = T.Compose([  # T.RandomCrop(32, padding=4),
         T.ToTensor(),
     ])  # T.Normalize((0.4914, 0.4822, 0.4465), (0.2464, 0.2428, 0.2608)),                                 T.RandomHorizontalFlip(),
-    # Transforms
-
     test_transform = T.Compose([T.ToTensor(), ])  # T.Normalize((0.4914, 0.4822, 0.4465), (0.2464, 0.2428, 0.2608))
-    train_set = CIFAR10('../data/cifar', train=True, transform=None, download=True)
-    test_set = CIFAR10('../data/cifar', train=False, transform=train_transform, download=True)
-    multi_view_dataset = MultiViewCIFAR(train_set, args.k, train_transform, train_transform)
-    original_train_set = CIFAR10('../data/cifar', train=True, transform=train_transform, download=True)
-
-elif args.dataset == 'CelebA':
-    train_transform = T.Compose([T.Resize((32, 32)),
-                                 T.ToTensor(),
-                                 ])  # T.Normalize((0.4914, 0.4822, 0.4465), (0.2464, 0.2428, 0.2608)),                                 T.RandomHorizontalFlip(),
-    test_transform = T.Compose([T.ToTensor(),
-                                ])  # T.Normalize((0.4914, 0.4822, 0.4465), (0.2464, 0.2428, 0.2608))
-    #/kaggle/input/celeba/
-    data_path = '../data/CelebA'
-    train_set = CelebA(data_path, split='train', target_type = 'attr', transform=train_transform, download=False)
-    test_set = CelebA(data_path, split='test', target_type = 'attr', transform=train_transform, download=False)
-
-
-
+    train_set = CIFAR10('../data/cifar', train=True, transform=train_transform, download=True)
+    test_set = CIFAR10('../data/cifar', train=False, transform=test_transform, download=True)
+    train_set_no_aug = CIFAR10('../data/cifar', train=True, transform=test_transform, download=True)
 
 train_loader = DataLoader(multi_view_dataset, batch_size=args.batch_size, shuffle=True)
 original_train_loader = DataLoader(original_train_set, batch_size=args.batch_size, shuffle=False)
 test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=True )
-
-# Extract all indices from the original dataset
-all_indices = list(range(len(original_train_set)))
-
-# Randomly select indices for the unlearning dataset
-unlearning_indices = random.sample(all_indices, args.unlearning_size)
-
-# Calculate remaining indices
-remaining_indices = list(set(all_indices) - set(unlearning_indices))
-
-# Create Subset datasets
-unlearning_dataset = Subset(original_train_set, unlearning_indices)
-remaining_dataset = Subset(original_train_set, remaining_indices)
-
-
-
-# Create new DataLoaders
-unlearning_loader = DataLoader(unlearning_dataset, batch_size=args.batch_size, shuffle=True)
-remaining_loader = DataLoader(remaining_dataset, batch_size=args.batch_size, shuffle=True)
-
 
 full_size = len(multi_view_dataset)
 original_size = len(original_train_set)
@@ -2046,7 +1462,7 @@ train_type = args.train_type
 start_time = time.time()
 for epoch in range(args.num_epochs):
     vib.train()
-    vib = vib_train(remaining_loader, vib, loss_fn, reconstruction_function, args, epoch, train_type)  # dataloader_total, dataloader_w_o_twin
+    vib = vib_train(train_loader, vib, loss_fn, reconstruction_function, args, epoch, train_type)  # dataloader_total, dataloader_w_o_twin
 
 
 print('acc list', clean_acc_list)
@@ -2057,143 +1473,196 @@ print(f'VIB Training took {running_time} seconds')
 
 # train infer model
 
-vib_for_infer = copy.deepcopy(vib)
-
-infer_model = get_membership_inf_model(original_train_set, test_set, vib_for_infer, args)
+infer_model = get_membership_inf_model(original_train_set, test_set, vib, args)
 
 ########
 
 vib.eval()
-acc_t = eva_vib(vib, test_loader, args, name='on test dataset before unlearning', epoch=999)
-acc_r = eva_vib(vib, original_train_loader, args, name='on the remaining training before unlearning', epoch=999)
+acc_t = eva_vib(vib, test_loader, args, name='on test dataset after unlearning', epoch=999)
+acc_r = eva_vib(vib, original_train_loader, args, name='on the remaining training after unlearning', epoch=999)
 
 
-acc_ua = eva_vib(vib, unlearning_loader, args, name='on the unlearning data before unlearning', epoch=999)
+
+vib.eval()
+all_embeddings = []
+all_labels = []
+
+with torch.no_grad():
+    for step, (images, labels) in enumerate(original_train_loader):
+        images = images.to(device)
+        labels = labels.to(device)
+        z, logits_y, x_hat, mu, logvar = vib(images, mode='with_reconstruction')  # (B, C* h* w), (B, N, 10)
+        z = F.normalize(z, p=2, dim=1)
+        all_embeddings.append(z.cuda())
+        all_labels.append(labels.cuda())
+        # print(z.shape)
+
+# Combine embeddings and labels into single tensors
+all_embeddings = torch.cat(all_embeddings, dim=0)  # [N, d]
+all_labels = torch.cat(all_labels, dim=0)          # [N]
+
+
+# Filter embeddings for label = 1
+label_1_mask = (all_labels == 1)
+label_1_embeddings = all_embeddings[label_1_mask]
+
+# Compute centroid (mean of embeddings for label = 1)
+if label_1_embeddings.size(0) > 0:
+    centroid_z = label_1_embeddings.mean(dim=0)  # Shape: [embedding_dim]
+    print(f"Centroid for label = 1: {centroid_z}")
+else:
+    print("No samples with label = 1 found in the dataset.")
+
+unlearning_samples = 10
+
+unlearn_indices = torch.where(label_1_mask)[0][:unlearning_samples]  # Example: Select the first 10 samples
+
+# Ensure unlearn_embeddings are collected for the specified indices
+unlearn_embeddings = all_embeddings[unlearn_indices]
+
+# Calculate distances between the centroid and each embedding in unlearn_indices
+distances = pairwise_distance(unlearn_embeddings, centroid_z.unsqueeze(0))  # Shape: [len(unlearn_indices)]
+
+print("distance before unlearning: ",distances.mean())
+
+
+unlearn_images = [original_train_loader.dataset[i][0].to(device) for i in unlearn_indices]
+unlearn_images_with_label = [original_train_loader.dataset[i] for i in unlearn_indices]
+
+unlearning_data_loader = DataLoader(unlearn_images_with_label, batch_size=args.batch_size, shuffle=True)
+
+acc_ua = eva_vib(vib, unlearning_data_loader, args, name='on the unlearning data before unlearning', epoch=999)
 print("acc_ua:", 1 - acc_ua)
 
-labeled_unlearn_set = CustomLabelDataset(unlearning_dataset, 0)  # we set label to 0 as the unlearned should not in the training set
+labeled_unlearn_set = CustomLabelDataset(unlearn_images_with_label, 0) # we set label to 0 as the unlearned should not in the training set
 
-unl_infer_data_loader = DataLoader(labeled_unlearn_set, batch_size=args.batch_size, shuffle=True)
-# calculate after unlearning
-infer_acc = membership_inf_results(infer_model, vib_for_infer, unl_infer_data_loader, "before unl")
+concatenated_dataset = ConcatDataset([labeled_unlearn_set, labeled_unlearn_set])
+unl_infer_data_loader = DataLoader(concatenated_dataset, batch_size=args.batch_size, shuffle=True)
 
-
-
-# unlearning_loader
-
-# train_loader
+# calculate berfore unlearning
+infer_acc = membership_inf_results(infer_model, vib, unl_infer_data_loader, "Before unl")
 
 
-@torch.no_grad()
-def collect_z(loader, vib, device, n_samples, is_multiview=False, view_idx=0, normalize=True):
-    vib.eval()
-    zs, ys = [], []
-    seen = 0
 
-    for batch in loader:
-        if is_multiview:
-            # train_loader (MultiViewMNIST): x_list is length k, each is [B,1,28,28]
-            x_list, y_list = batch
-            x = x_list[view_idx].to(device)
-            y = y_list[view_idx].to(device)
-        else:
-            # unlearning_loader: (x, y)
-            x, y = batch
-            x, y = x.to(device), y.to(device)
+# Convert unlearn_indices to NumPy for indexing the t-SNE result
+unlearn_indices_np = unlearn_indices.cpu().numpy()
 
-        z, *_ = vib(x, mode='with_reconstruction')   # z == logits_z  (B, dimZ)
-        if normalize:
-            z = F.normalize(z, p=2, dim=1)
+# Limit the number of samples for t-SNE (optional)
+N = 5000
+all_embeddings2 = all_embeddings[:N]
+all_labels2 = all_labels[:N]
 
-        take = min(n_samples - seen, z.size(0))
-        zs.append(z[:take].cpu())
-        ys.append(y[:take].cpu())
-        seen += take
+# Dimensionality Reduction with t-SNE (still using sklearn)
+tsne = TSNE(n_components=2, learning_rate='auto', init='pca', random_state=42)
+emb_2d = tsne.fit_transform(all_embeddings2.cpu().numpy())  # sklearn requires NumPy
 
-        if seen >= n_samples:
-            break
+# Plot the 2D embeddings, here we show the distribution before unlearning,
+plt.figure(figsize=(10, 10))
+scatter = plt.scatter(emb_2d[:, 0], emb_2d[:, 1], c=all_labels2.cpu().numpy(), cmap='tab10', alpha=0.7, s=10, label="All Samples")
 
-    return torch.cat(zs, dim=0), torch.cat(ys, dim=0)
-
-# 1) collect representations
-z_unl, y_unl = collect_z(unlearning_loader, vib, args.device, n_samples=200,  is_multiview=False)
-z_trn, y_trn = collect_z(remaining_loader,     vib, args.device, n_samples=4000, is_multiview=True, view_idx=0)
-
-# 2) t-SNE
-Z = torch.cat([z_trn, z_unl], dim=0).numpy()
-group = np.array([0] * len(z_trn) + [1] * len(z_unl))  # 0=train, 1=unlearning
-labels = torch.cat([y_trn, y_unl], dim=0).numpy()
-
-tsne = TSNE(
-    n_components=2,
-    perplexity=30,
-    init="pca",
-    learning_rate="auto",
-    random_state=0,
-)
-Z2 = tsne.fit_transform(Z)
-
-# 3) plot: train vs unlearning
-
-# tab10 in the exact order shown: 0..9
-cmap = ListedColormap(plt.cm.tab10.colors)
-bounds = np.arange(-0.5, 10.5, 1)          # [-0.5, 0.5, 1.5, ..., 9.5]
-norm = BoundaryNorm(bounds, cmap.N)
-
-fig, ax = plt.subplots(figsize=(7, 6))
-
-idx_tr = (group == 0)
-idx_un = (group == 1)
-
-ax.scatter(
-    Z2[idx_tr, 0], Z2[idx_tr, 1],
-    c=labels[idx_tr],
-    cmap=cmap, norm=norm,
-    s=6, alpha=0.35,
-    marker="o", linewidths=0,
-    label="Retrain"
+# Highlight the selected samples (unlearn_indices)
+plt.scatter(
+    emb_2d[unlearn_indices_np, 0],  # x-coordinates of selected samples
+    emb_2d[unlearn_indices_np, 1],  # y-coordinates of selected samples
+    c='red',  # Color for highlighted samples
+    marker='x',  # Marker style for highlighted samples
+    s=150,  # Marker size
+    label="Selected Samples"
 )
 
-ax.scatter(
-    Z2[idx_un, 0], Z2[idx_un, 1],
-    c=labels[idx_un],
-    cmap=cmap, norm=norm,
-    s=40, alpha=0.95,
-    marker="o", linewidths=0,
-    label="Unlearn"
-)
+cbar = plt.colorbar(scatter, ticks=range(10), fraction=0.046, pad=0.04)
 
-ax.legend(loc="best", frameon=True)
-cb = fig.colorbar(ax.collections[-1], ax=ax, ticks=np.arange(10))  # attach to last scatter
-ax.set_title("Retrain - Random Unlearning: 10%")
+cbar.ax.tick_params(labelsize=20)
 
-fig.tight_layout()
+plt.title("Learned Representations with MMCRs", fontsize=24)  # 2D Visualization of Learned Representations with MMCRs
+plt.xlabel("Dimension 1", fontsize=20)
+plt.ylabel("Dimension 2", fontsize=20)
 
-# SAVE FIRST
-fig.savefig("Retrain_random_forgetting10p.pdf", dpi=300, bbox_inches="tight")
-#fig.savefig("Retrain_random_forgetting10p.png", dpi=300, bbox_inches="tight")  # optional
+plt.xticks(fontsize=20)
+plt.yticks(fontsize=20)
 
-plt.show()
-plt.close(fig)  # optional, frees memory
+plt.legend(fontsize=20)
+
+plt.savefig("Representation_with_MMCRs.pdf", dpi=300)  # Save with high resolution
 
 
 
 
-# unlearning
+# 为对比损失做准备
+# Positives: 同类但未被unlearn_indices选中的
+remaining_label_1_indices = torch.where(label_1_mask)[0]
+# 去掉unlearn的indices，剩下的作为potential positives
+positives_indices = remaining_label_1_indices[~torch.isin(remaining_label_1_indices, unlearn_indices)]
+positives_embeddings = all_embeddings[positives_indices].to(device)
+
+# Negatives: 全部erased类的数据 (label=1类)可作为负样本
+negatives_indices = torch.where(label_1_mask)[0]
+negatives_embeddings = all_embeddings[negatives_indices].to(device)
+
+tau = 0.07  # 温度参数，可调
+
+optimizer = torch.optim.Adam(vib.parameters(), lr=args.lr)
 
 
-""""
-#unlearning_loader_with_c_p = prepare_centroid_and_positive(vib, unlearning_loader, remaining_loader, args)
-
-unlearning_with_new_center, top_k_nearest_loader = create_unlearning_with_topk_loader(vib, unlearning_loader, remaining_loader, args, top_k=5, shuffle=True)
 # record time for unlearning
-
 start_time = time.time()
-vib_unlearnined = copy.deepcopy(vib)
 
-#vib_unlearnined = triplet_contrastive_unlearning(vib_unlearnined, unlearning_loader, remaining_loader, args.margin, args.unl_epochs, loss_fn, args)
+epochs = 1
+for epoch in range(epochs):
+    vib.train()  # Switch to training mode
+    num_correct = 0
+    num_total = 0
+    for images, labels in unlearning_data_loader:
+        images, labels = images.to(device), labels.to(device)
 
-vib_unlearnined = unlearning_with_topk(vib_unlearnined, unlearning_with_new_center, top_k_nearest_loader, loss_fn, reconstruction_function, args)
+        z_unlearn, logits_y, _, _, _ = vib(images, mode='with_reconstruction')
+        z_unlearn = F.normalize(z_unlearn, p=2, dim=1)
+
+        if labels.ndim == 2:
+            labels = labels.argmax(dim=1)
+        num_correct += (logits_y.argmax(dim=1) == labels).sum().item()
+        num_total += len(images)
+
+
+        # Loss: Maximize the distance to the centroid
+        distance_loss = torch.norm(z_unlearn - centroid_z.to(device), p=2, dim=1).mean()  # Maximize distance
+        unlearning_loss = - distance_loss  # Negate to maximize distance
+
+
+        if positives_embeddings.size(0) > 0 and negatives_embeddings.size(0) > 0:
+            # anchor与positives: (B, M_pos)
+            # anchor与negatives: (B, M_neg)
+            sim_pos = torch.matmul(z_unlearn, positives_embeddings.t()) / tau  # [B, M_pos]
+            sim_neg = torch.matmul(z_unlearn, negatives_embeddings.t()) / tau  # [B, M_neg]
+
+            # 合并pos和neg成一个张量 [B, M_pos+M_neg]
+            sim_all = torch.cat([sim_pos, sim_neg], dim=1)  # [B, M_pos + M_neg]
+
+            log_probs = F.log_softmax(sim_all, dim=1)  # [B, M_pos+M_neg]
+
+            # 正样本对应前M_pos列
+            pos_log_probs = log_probs[:, :positives_embeddings.size(0)]  # [B, M_pos]
+
+            # 对正样本求平均loss
+            contrastive_loss = - pos_log_probs.mean()
+
+        else:
+            # 如果没有正样本或负样本，可以跳过或设为0
+            contrastive_loss = torch.tensor(0.0, device=device)
+
+        # 总loss = unlearning_loss + 某个权重 * contrastive_loss
+        # 这里假设我们平衡两者的重要性，将二者简单相加或给对比loss一个较小权重
+        loss = 0.1*unlearning_loss + 0.1 * contrastive_loss
+
+        print("distance", distance_loss.item(), "contrastive_loss", contrastive_loss.item())
+        # Backpropagation and optimization
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    acc = num_correct / num_total
+    acc = round(acc, 5)
+
+    print(f"Epoch {epoch+1}/{epochs}, Loss: {loss.item()}, acc: {acc}, {1-acc}")
 
 print("Unlearning completed.")
 
@@ -2201,18 +1670,82 @@ end_time = time.time()
 running_time = end_time - start_time
 print(f'unlearning with dp {running_time} seconds')
 
+# calculate after unlearning
+infer_acc = membership_inf_results(infer_model, vib, unl_infer_data_loader, "after unl")
 
-# calculate berfore unlearning
-infer_acc = membership_inf_results(infer_model, vib_unlearnined, unl_infer_data_loader, "after unl")
+# Step 1: Compute updated embeddings after unlearning
+vib.eval()
+all_embeddings_after = []
+all_labels_after = []
+with torch.no_grad():
+    for step, (images, labels) in enumerate(original_train_loader):
+        images = images.to(device)
+        labels = labels.to(device)
+        z, _, _, _, _ = vib(images, mode='with_reconstruction')
+        z = F.normalize(z, p=2, dim=1)
+        all_embeddings_after.append(z.cuda())
+        all_labels_after.append(labels.cuda())
+
+all_embeddings_after = torch.cat(all_embeddings_after, dim=0)  # Combine into a single tensor
 
 
-vib_unlearnined.eval()
-acc_t = eva_vib(vib_unlearnined, test_loader, args, name='on test dataset after unlearning', epoch=999)
-acc_r = eva_vib(vib_unlearnined, original_train_loader, args, name='on the remaining training after unlearning', epoch=999)
-acc_ua = eva_vib(vib_unlearnined, unlearning_loader, args, name='on the unlearning data after unlearning', epoch=999)
+# Ensure unlearn_embeddings are collected for the specified indices
+unlearn_embeddings = all_embeddings_after[unlearn_indices]
+
+# Calculate distances between the centroid and each embedding in unlearn_indices
+distances_after = pairwise_distance(unlearn_embeddings, centroid_z.unsqueeze(0))  # Shape: [len(unlearn_indices)]
+
+print("distance after unlearning: ", distances_after.mean(), "distance dif:", distances_after.mean() - distances.mean())
+
+
+# Step 2: Perform t-SNE on the updated embeddings
+# tsne_after = TSNE(n_components=2, learning_rate='auto', init='pca', random_state=42)
+emb_2d_after = tsne.fit_transform(all_embeddings_after[:N].cpu().numpy())  # sklearn requires NumPy
+all_labels_after = torch.cat(all_labels_after, dim=0)
+all_labels_2d_after = all_labels_after[:N]
+# Step 3: Highlight unlearned samples
+unlearn_indices_np = unlearn_indices.cpu().numpy()
+
+
+plt.figure(figsize=(10, 10))
+scatter = plt.scatter(
+    emb_2d_after[:, 0], emb_2d_after[:, 1], c=all_labels_2d_after.cpu().numpy(), cmap='tab10', alpha=0.7, s=10, label="All Samples"
+)
+
+# Highlight the unlearned samples
+plt.scatter(
+    emb_2d_after[unlearn_indices_np, 0],  # x-coordinates of unlearned samples
+    emb_2d_after[unlearn_indices_np, 1],  # y-coordinates of unlearned samples
+    c='red',
+    marker='x',
+    s=150,
+    label="Unlearned Samples"
+)
+
+# Add a legend and color bar
+plt.colorbar(scatter, ticks=range(10))
+
+
+plt.title("Unlearned Representations with MMCRs", fontsize=24)  # 2D Visualization of Learned Representations with MMCRs
+plt.xlabel("Dimension 1", fontsize=20)
+plt.ylabel("Dimension 2", fontsize=20)
+
+plt.xticks(fontsize=20)
+plt.yticks(fontsize=20)
+
+plt.legend(fontsize=20)
+plt.show()
+
+plt.savefig("unl_Representation_with_MMCRs.pdf", dpi=300)  # Save with high resolution
+
+
+
+
+vib.eval()
+acc_t = eva_vib(vib, test_loader, args, name='on test dataset after unlearning', epoch=999)
+acc_r = eva_vib(vib, original_train_loader, args, name='on the remaining training after unlearning', epoch=999)
+acc_ua = eva_vib(vib, unlearning_data_loader, args, name='on the unlearning data after unlearning', epoch=999)
 print("acc_ua:", 1 - acc_ua)
-"""
-
 
 
 

@@ -1072,6 +1072,7 @@ def eva_vib(vib, dataloader_erase, args, name='test', epoch=999):
 
     num_total = 0
     num_correct = 0
+    MSE_total = 0
     for batch_idx, (x, y) in enumerate(dataloader_erase):
         x, y = x.to(args.device), y.to(args.device)  # (B, C, H, W), (B, 10)
         # x = x.view(x.size(0), -1)
@@ -1080,6 +1081,10 @@ def eva_vib(vib, dataloader_erase, args, name='test', epoch=999):
 
         x_hat = x_hat.view(x_hat.size(0), -1)
 
+        x_hat = x_hat.view(x_hat.size(0), -1)
+        x = x.view(x.size(0), -1)
+        BCE = reconstruction_function(x_hat, x)
+        MSE_total += BCE.item()
         if y.ndim == 2:
             y = y.argmax(dim=1)
         num_correct += (logits_y.argmax(dim=1) == y).sum().item()
@@ -1087,7 +1092,8 @@ def eva_vib(vib, dataloader_erase, args, name='test', epoch=999):
 
     acc = num_correct / num_total
     acc = round(acc, 5)
-    print(f'epoch {epoch}, {name} accuracy:  {acc:.4f}, total_num:{num_total}', x.shape)
+    avg_mse = MSE_total / num_total
+    print(f'epoch {epoch}, {name} accuracy:  {acc:.4f}, total_num:{num_total}, avg_mse:{avg_mse}', x.shape)
     return acc
 
 
@@ -1562,8 +1568,8 @@ args.unl_epochs = 1
 args.infer_t_epochs = 5
 args.dataset = 'CIFAR10'
 args.add_noise = False
-args.beta = 0.001
-args.mcr_rate = 0.001
+args.beta = 0.0001
+args.mcr_rate = 0.001 # 0 #0.001
 args.mse_rate = 0.1
 args.lr = 0.0005
 args.distance_rate = 0.0001
@@ -1572,7 +1578,7 @@ args.unlearn_learning_rate = 0.1
 args.ep_distance = 20
 args.dimZ =  64 #10 /2  # 40 # 2
 args.batch_size = 16
-args.unlearning_size =100
+args.unlearning_size =200
 args.erased_local_r = 0.02
 args.construct_size = 0.02
 # args.auxiliary_size = 0.01

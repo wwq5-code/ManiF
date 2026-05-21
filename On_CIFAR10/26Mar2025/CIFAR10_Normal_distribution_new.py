@@ -18,6 +18,7 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
 import numpy as np
 from torch.utils.data import DataLoader, Dataset, Subset
 import copy
@@ -792,7 +793,6 @@ def vib_train(dataset, model, loss_fn, reconstruction_function, args, epoch, tra
         H_p_q = loss_fn(logits_y, y)
 
         KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar).cuda()
-        KLD = torch.sum(KLD_element).mul_(-0.5).cuda()
         KLD_mean = torch.mean(KLD_element).mul_(-0.5).cuda()
 
         x_hat = x_hat.view(x_hat.size(0), -1)
@@ -1396,6 +1396,7 @@ def get_membership_inf_model(original_train_set, test_set, vib, args):
 
     return infer_model
 
+@torch.no_grad()
 def membership_inf_results(infer_model, vib, test_data_loader, state):
 
     # Initialize AUC metric
@@ -1783,6 +1784,37 @@ def connect_determined_alpha(model_a, x, positive_x, center_z_new, args):
     return alpha
 
 
+@torch.no_grad()
+def collect_z(loader, vib, device, n_samples, is_multiview=False, view_idx=0, normalize=True):
+    vib.eval()
+    zs, ys = [], []
+    seen = 0
+
+    for batch in loader:
+        if is_multiview:
+            # train_loader (MultiViewMNIST): x_list is length k, each is [B,1,28,28]
+            x_list, y_list = batch
+            x = x_list[view_idx].to(device)
+            y = y_list[view_idx].to(device)
+        else:
+            # unlearning_loader: (x, y)
+            x, y = batch
+            x, y = x.to(device), y.to(device)
+
+        z, *_ = vib(x, mode='with_reconstruction')   # z == logits_z  (B, dimZ)
+        if normalize:
+            z = F.normalize(z, p=2, dim=1)
+
+        take = min(n_samples - seen, z.size(0))
+        zs.append(z[:take].cpu())
+        ys.append(y[:take].cpu())
+        seen += take
+
+        if seen >= n_samples:
+            break
+
+    return torch.cat(zs, dim=0), torch.cat(ys, dim=0)
+
 
 def unlearning_with_topk(vib, unlearning_loader_with_center, top_k_nearest_loader, loss_fn, reconstruction_function, args):
     optimizer = torch.optim.Adam(vib.parameters(), lr=args.lr)
@@ -1792,7 +1824,7 @@ def unlearning_with_topk(vib, unlearning_loader_with_center, top_k_nearest_loade
 
         for x, center_z_new, y, positive_x in unlearning_loader_with_center:
             x, center_z_new,  y , positive_x = x.to(args.device), center_z_new.to(args.device), y.to(args.device), positive_x.to(args.device)
-            logits_z, logits_y, x_hat, mu, _ = vib(x, mode='with_reconstruction')
+            logits_z, logits_y, x_hat, mu, logvar = vib(x, mode='with_reconstruction')
             logits_z_p, logits_y_p, _, mu_p, _ = vib(positive_x, mode='with_reconstruction')
 
             H_p_q = loss_fn(logits_y_p, y)
@@ -1803,7 +1835,17 @@ def unlearning_with_topk(vib, unlearning_loader_with_center, top_k_nearest_loade
             BCE = F.l1_loss(x_hat, x) #reconstruction_function(x_hat, x)
 
             # add H_p_q for with label test, otherwise remove H_p_q
-            loss = 0.001  * (F.mse_loss(logits_z_p, center_z_new) -  F.mse_loss(logits_z, center_z_new) + alpha  ) + BCE# +H_p_q#  + alpha  + H_p_q + 0.02
+
+            # loss = 0.001  * (F.mse_loss(logits_z_p, logits_z) -  F.mse_loss(logits_z, center_z_new) + alpha) + BCE# +H_p_q#  + alpha  + H_p_q + 0.02
+
+            # loss for GA vae
+
+            KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar).cuda()
+            KLD_mean = torch.mean(KLD_element).mul_(-0.5).cuda()
+
+
+            loss = 0.0001 * KLD_mean - 0.001 * BCE
+
             # loss = 0.1 * (1.001 * F.cosine_similarity(logits_z, center_z_new, dim=-1).mean() * F.cosine_similarity(
             #     logits_z, center_z_new, dim=-1).mean() -
             #               F.cosine_similarity(logits_z_p, center_z_new, dim=-1).mean() * F.cosine_similarity(logits_z_p, center_z_new, dim=-1).mean() )
@@ -1918,7 +1960,7 @@ args.infer_t_epochs = 5
 args.dataset = 'CIFAR10'
 args.add_noise = False
 args.beta = 0.0001
-args.mcr_rate = 0.001# 0 #0.001
+args.mcr_rate = 0.001 # 0 #0.001
 args.mse_rate = 0.1
 args.lr = 0.0005
 args.distance_rate = 0.01
@@ -2015,7 +2057,15 @@ test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=True )
 all_indices = list(range(len(original_train_set)))
 
 # Randomly select indices for the unlearning dataset
-unlearning_indices = random.sample(all_indices, args.unlearning_size)
+# unlearning_indices = random.sample(all_indices, args.unlearning_size)
+
+target_class = 1  # class you want to unlearn
+
+# Get all indices of samples belonging to target_class
+class_indices = [i for i, (_, label) in enumerate(original_train_set) if label == target_class]
+
+# Randomly sample from that class
+unlearning_indices = random.sample(class_indices, args.unlearning_size)
 
 # Calculate remaining indices
 remaining_indices = list(set(all_indices) - set(unlearning_indices))
@@ -2042,7 +2092,7 @@ vib.to(args.device)
 
 loss_fn = nn.CrossEntropyLoss()
 
-reconstruction_function =  nn.MSELoss(size_average=True)
+reconstruction_function = nn.MSELoss(size_average=True)
 
 acc_test = []
 print("learning")
@@ -2131,5 +2181,78 @@ print("acc_ua:", 1 - acc_ua)
 
 
 
+
+# 1) collect representations
+z_unl, y_unl = collect_z(unlearning_loader, vib_unlearnined, args.device, n_samples=400,  is_multiview=False)
+z_trn, y_trn = collect_z(remaining_loader, vib_unlearnined, args.device, n_samples=4000, is_multiview=False, view_idx=0)
+
+# 2) t-SNE
+Z = torch.cat([z_trn, z_unl], dim=0).numpy()
+group = np.array([0] * len(z_trn) + [1] * len(z_unl))  # 0=train, 1=unlearning
+labels = torch.cat([y_trn, y_unl], dim=0).numpy()
+
+tsne = TSNE(
+    n_components=2,
+    perplexity=30,
+    init="pca",
+    learning_rate="auto",
+    random_state=0,
+)
+Z2 = tsne.fit_transform(Z)
+
+# 3) plot: train vs unlearning
+
+# tab10 in the exact order shown: 0..9
+cmap = ListedColormap(plt.cm.tab10.colors)
+bounds = np.arange(-0.5, 10.5, 1)          # [-0.5, 0.5, 1.5, ..., 9.5]
+norm = BoundaryNorm(bounds, cmap.N)
+
+fig, ax = plt.subplots(figsize=(7, 6))
+
+idx_tr = (group == 0)
+idx_un = (group == 1)
+
+ax.scatter(
+    Z2[idx_tr, 0], Z2[idx_tr, 1],
+    c=labels[idx_tr],
+    cmap=cmap, norm=norm,
+    s=6, alpha=0.35,
+    marker="o", linewidths=0,
+    label="Retrain"
+)
+
+ax.scatter(
+    Z2[idx_un, 0], Z2[idx_un, 1],
+    c=labels[idx_un],
+    cmap=cmap, norm=norm,
+    s=40, alpha=0.95,
+    marker="o", linewidths=0,
+    label="Unlearn"
+)
+
+ax.legend(loc="best", frameon=True)
+# CIFAR-10 class names (order matches labels 0..9)
+cifar10_classes = [
+    "airplane", "automobile", "bird", "cat", "deer",
+    "dog", "frog", "horse", "ship", "truck"
+]
+
+# ... your scatter code ...
+
+cb = fig.colorbar(ax.collections[-1], ax=ax)   # attach to last scatter
+cb.set_ticks(np.arange(10))
+cb.set_ticklabels(cifar10_classes)
+
+#cb = fig.colorbar(ax.collections[-1], ax=ax, ticks=np.arange(10))  # attach to last scatter
+ax.set_title("ManiF-SMC - Random Unlearning: 1%, CIFAR10")
+
+fig.tight_layout()
+
+# SAVE FIRST
+fig.savefig("ManiFU_random_forgetting10p_CIFAR10.pdf", dpi=300, bbox_inches="tight")
+#fig.savefig("Retrain_random_forgetting10p.png", dpi=300, bbox_inches="tight")  # optional
+
+plt.show()
+plt.close(fig)  # optional, frees memory
 
 

@@ -18,6 +18,7 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
 import numpy as np
 from torch.utils.data import DataLoader, Dataset, Subset
 import copy
@@ -1519,6 +1520,36 @@ def triplet_contrastive_unlearning(vib, unlearning_loader_with_c_p, margin, epoc
 
     return vib
 
+@torch.no_grad()
+def collect_z(loader, vib, device, n_samples, is_multiview=False, view_idx=0, normalize=True):
+    vib.eval()
+    zs, ys = [], []
+    seen = 0
+
+    for batch in loader:
+        if is_multiview:
+            # train_loader (MultiViewMNIST): x_list is length k, each is [B,1,28,28]
+            x_list, y_list = batch
+            x = x_list[view_idx].to(device)
+            y = y_list[view_idx].to(device)
+        else:
+            # unlearning_loader: (x, y)
+            x, y = batch
+            x, y = x.to(device), y.to(device)
+
+        z, *_ = vib(x, mode='with_reconstruction')   # z == logits_z  (B, dimZ)
+        if normalize:
+            z = F.normalize(z, p=2, dim=1)
+
+        take = min(n_samples - seen, z.size(0))
+        zs.append(z[:take].cpu())
+        ys.append(y[:take].cpu())
+        seen += take
+
+        if seen >= n_samples:
+            break
+
+    return torch.cat(zs, dim=0), torch.cat(ys, dim=0)
 
 
 class TransformSubset(Subset):
@@ -1566,7 +1597,7 @@ args.unlearn_learning_rate = 0.1
 args.ep_distance = 20
 args.dimZ =  64 #10 /2  # 40 # 2
 args.batch_size = 16
-args.unlearning_size =1000
+args.unlearning_size =400
 args.erased_local_r = 0.02
 args.construct_size = 0.02
 # args.auxiliary_size = 0.01
@@ -1761,6 +1792,81 @@ acc_ua = eva_vib(unlearned_vib, unlearning_loader, args, name='on the unlearning
 print("acc_ua:", 1 - acc_ua)
 
 
+
+
+
+# 1) collect representations
+z_unl, y_unl = collect_z(unlearning_loader, unlearned_vib, args.device, n_samples=400,  is_multiview=False)
+z_trn, y_trn = collect_z(remaining_loader, unlearned_vib, args.device, n_samples=4000, is_multiview=False, view_idx=0)
+
+# 2) t-SNE
+Z = torch.cat([z_trn, z_unl], dim=0).numpy()
+group = np.array([0] * len(z_trn) + [1] * len(z_unl))  # 0=train, 1=unlearning
+labels = torch.cat([y_trn, y_unl], dim=0).numpy()
+
+tsne = TSNE(
+    n_components=2,
+    perplexity=30,
+    init="pca",
+    learning_rate="auto",
+    random_state=0,
+)
+Z2 = tsne.fit_transform(Z)
+
+# 3) plot: train vs unlearning
+
+# tab10 in the exact order shown: 0..9
+cmap = ListedColormap(plt.cm.tab10.colors)
+bounds = np.arange(-0.5, 10.5, 1)          # [-0.5, 0.5, 1.5, ..., 9.5]
+norm = BoundaryNorm(bounds, cmap.N)
+
+fig, ax = plt.subplots(figsize=(7, 6))
+
+idx_tr = (group == 0)
+idx_un = (group == 1)
+
+ax.scatter(
+    Z2[idx_tr, 0], Z2[idx_tr, 1],
+    c=labels[idx_tr],
+    cmap=cmap, norm=norm,
+    s=6, alpha=0.35,
+    marker="o", linewidths=0,
+    label="Retrain"
+)
+
+ax.scatter(
+    Z2[idx_un, 0], Z2[idx_un, 1],
+    c=labels[idx_un],
+    cmap=cmap, norm=norm,
+    s=40, alpha=0.95,
+    marker="o", linewidths=0,
+    label="Unlearn"
+)
+
+ax.legend(loc="best", frameon=True)
+# CIFAR-10 class names (order matches labels 0..9)
+cifar10_classes = [
+    "airplane", "automobile", "bird", "cat", "deer",
+    "dog", "frog", "horse", "ship", "truck"
+]
+
+# ... your scatter code ...
+
+cb = fig.colorbar(ax.collections[-1], ax=ax)   # attach to last scatter
+cb.set_ticks(np.arange(10))
+cb.set_ticklabels(cifar10_classes)
+
+#cb = fig.colorbar(ax.collections[-1], ax=ax, ticks=np.arange(10))  # attach to last scatter
+ax.set_title("SalUn - Random Unlearning: 1%, CIFAR10")
+
+fig.tight_layout()
+
+# SAVE FIRST
+fig.savefig("SalUn_random_forgetting10p_CIFAR10.pdf", dpi=300, bbox_inches="tight")
+#fig.savefig("Retrain_random_forgetting10p.png", dpi=300, bbox_inches="tight")  # optional
+
+plt.show()
+plt.close(fig)  # optional, frees memory
 
 
 

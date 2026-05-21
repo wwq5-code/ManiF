@@ -16,7 +16,7 @@ labels = ['200', '400', '600', '800', '1000', '1200']
 # unl_org = [97.77, 97.55, 97.35, 97.29, 97.21, 97.21]
 
 # unl_hess_r = [96.6, 96.66, 96.04, 95.94, 95.85, 97.21]
-OUL = [0.59032, 0.63032, 0.6700, 0.67842, 0.6940, 0.7633]
+OUL = [0.59032, 0.63072, 0.6698, 0.6788, 0.6947, 0.7633]
 
 org_acc = [0.5483, 0.5483, 0.5483, 0.5483, 0.5483, 0.5483]
 
@@ -31,7 +31,7 @@ for i in range(len(OUL)):
     vbu_ldp_acc[i] = vbu_ldp_acc[i] * 100
 
 plt.style.use('seaborn')
-plt.figure(figsize=(5.5, 5.3))
+plt.figure(figsize=(6.5, 5.0))
 l_w=5
 m_s=15
 marker_s = 3
@@ -62,12 +62,12 @@ plt.plot(x, vbu_ldp_acc, linestyle='-.', color='#E1C855',  marker='^', fillstyle
 leg = plt.legend(fancybox=True, shadow=True)
 # plt.xlabel('Malicious Client Ratio (%)' ,fontsize=16)
 plt.ylabel('MIA (%)' ,fontsize=24)
-my_y_ticks = np.arange(50., 71, 4)
+my_y_ticks = np.arange(50., 81, 5)
 plt.yticks(my_y_ticks,fontsize=20)
 plt.xlabel('$\it USS$' ,fontsize=20)
 
 plt.xticks(x, labels, fontsize=20)
-plt.title('On CIFAR10',fontsize=24)
+#plt.title('On CIFAR10',fontsize=24)
 
 # plt.annotate(r"1e0", xy=(0.1, 1.01), xycoords='axes fraction', xytext=(-10, 10), textcoords='offset points', ha='right', va='center', fontsize=15)
 

@@ -31,7 +31,7 @@ for i in range(len(OUL)):
     vbu_ldp_acc[i] = vbu_ldp_acc[i] * 100
 
 plt.style.use('seaborn')
-plt.figure(figsize=(5.5, 5.3))
+plt.figure(figsize=(6.5, 5.0))
 l_w=5
 m_s=15
 marker_s = 3

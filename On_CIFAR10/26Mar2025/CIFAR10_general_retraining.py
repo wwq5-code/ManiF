@@ -765,8 +765,8 @@ def vib_train(dataset, model, loss_fn, reconstruction_function, args, epoch, tra
 
     for step, (x, y) in enumerate(dataset):
         # views_x: [B, k, 1, 28, 28]
-        x = torch.stack(x, dim=1)  # ensure it's a tensor
-        y = torch.stack(y, dim=1)  # ensure it's a tensor
+        #x = torch.stack(x, dim=1)  # ensure it's a tensor
+        #y = torch.stack(y, dim=1)  # ensure it's a tensor
         x, y = x.to(args.device), y.to(args.device)  # (B, C, H, W), (B, 10)
 
         # Stack the k views along the batch dimension for encoding
@@ -776,10 +776,10 @@ def vib_train(dataset, model, loss_fn, reconstruction_function, args, epoch, tra
         # Let's rearrange to handle all at once.
         # shape: B x k x C x H x W -> (B*k, C, H, W)
 
-        B, k, C_in, H, W = x.shape
+        B,  C_in, H, W = x.shape
 
-        x = x.view(B * k, C_in, H, W)
-        y = y.view(B * k)
+        x = x.view(B * 1, C_in, H, W)
+        y = y.view(B * 1)
 
         logits_z, logits_y, x_hat, mu, logvar = model(x, mode='with_reconstruction')  # (B, C* h* w), (B, N, 10)
         # VAE two loss: KLD + MSE
@@ -800,23 +800,23 @@ def vib_train(dataset, model, loss_fn, reconstruction_function, args, epoch, tra
         z = F.normalize(logits_z, p=2, dim=1)  # [B*k, d]
 
         # Reshape back to [B, k, d]
-        z = z.view(B, k, args.dimZ)
+        #z = z.view(B, k, args.dimZ)
 
         # Compute centroids: mean over k
-        centroids = z.mean(dim=1)  # [B, d]
+        #centroids = z.mean(dim=1)  # [B, d]
 
         # We want C = [d x B], so transpose:
-        C = centroids.transpose(0, 1)  # [d, B]
+        #C = centroids.transpose(0, 1)  # [d, B]
 
         # Compute nuclear norm of C
         # In newer PyTorch, we can use torch.linalg.svd
         # S: singular values
-        U, S, V = torch.svd(C)  # or torch.linalg.svd(C), depending on PyTorch version
-        nuclear_norm = S.sum()
+        #U, S, V = torch.svd(C)  # or torch.linalg.svd(C), depending on PyTorch version
+        # nuclear_norm = S.sum()
 
         # nuclear_norm = maximum_manifold_capacity(logits_z, gamma=0) + BCE
 
-        loss = args.beta * KLD_mean + BCE + H_p_q - args.mcr_rate * nuclear_norm #  + H_p_q + H_p_q - nuclear_norm  + H_p_q + H_p_q + nuclear_norm
+        loss = args.beta * KLD_mean + BCE + H_p_q # - args.mcr_rate * nuclear_norm #  + H_p_q + H_p_q - nuclear_norm  + H_p_q + H_p_q + nuclear_norm
 
         optimizer.zero_grad()
         loss.backward()
@@ -894,7 +894,7 @@ def prepare_unl(erasing_dataset, dataloader_remaining_after_aux, model, loss_fn,
             KLD_mean2 = torch.mean(KLD_element2).mul_(-0.5).to(args.device)
 
             loss = args.unlearn_learning_rate * (args.beta * KLD_mean - H_p_q) + args.self_sharing_rate * (
-                        args.beta * KLD_mean2 + H_p_q2)
+                        args.beta * KLD_mean2 + H_p_q2)  # args.beta * KLD_mean - H_p_q + args.beta * KLD_mean2  + H_p_q2 #- log_z / e_log_py #-   # H_p_q + args.beta * KLD_mean2
 
             optimizer.zero_grad()
             loss.backward()
@@ -1870,6 +1870,172 @@ def triplet_contrastive_unlearning(vib, unlearning_loader, remaining_loader, mar
 
     return vib
 
+@torch.no_grad()
+def collect_z(loader, vib, device, n_samples, is_multiview=False, view_idx=0, normalize=True):
+    vib.eval()
+    zs, ys = [], []
+    seen = 0
+
+    for batch in loader:
+        if is_multiview:
+            # train_loader (MultiViewMNIST): x_list is length k, each is [B,1,28,28]
+            x_list, y_list = batch
+            x = x_list[view_idx].to(device)
+            y = y_list[view_idx].to(device)
+        else:
+            # unlearning_loader: (x, y)
+            x, y = batch
+            x, y = x.to(device), y.to(device)
+
+        z, *_ = vib(x, mode='with_reconstruction')   # z == logits_z  (B, dimZ)
+        if normalize:
+            z = F.normalize(z, p=2, dim=1)
+
+        take = min(n_samples - seen, z.size(0))
+        zs.append(z[:take].cpu())
+        ys.append(y[:take].cpu())
+        seen += take
+
+        if seen >= n_samples:
+            break
+
+    return torch.cat(zs, dim=0), torch.cat(ys, dim=0)
+
+from itertools import cycle
+import torch
+import torch.nn.functional as F
+
+def _kld_mean_standard_normal(mu, logvar):
+    # 0.5 * (mu^2 + exp(logvar) - 1 - logvar)
+    return 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar).mean()
+
+def gradient_ascent_unl(
+    vib,
+    forget_loader,
+    retain_loader=None,              # optional
+    args=None,
+    loss_fn=None,                    # e.g. nn.CrossEntropyLoss()
+    reconstruction_function=None,     # e.g. nn.MSELoss()
+    epochs=1,
+    lr=1e-4,
+    forget_w=1.0,
+    retain_w=1.0,
+    include_recon_kld=False,         # True if you also want recon/KL in objectives
+    reg_w=0.0,                       # L2 to stay close to original params
+    grad_clip=5.0,
+    max_steps=None,
+    print_every=200,
+):
+    vib.train()
+
+    # snapshot for regularization (optional)
+    ref_params = None
+    if reg_w > 0:
+        ref_params = [p.detach().clone() for p in vib.parameters() if p.requires_grad]
+
+    opt = torch.optim.Adam(vib.parameters(), lr=lr)
+
+    retain_iter = cycle(retain_loader) if retain_loader is not None else None
+    step = 0
+
+    for ep in range(epochs):
+        running = {"ce_f": 0.0, "ce_r": 0.0, "reg": 0.0, "loss": 0.0}
+        n = 0
+
+        for (x_f, y_f) in forget_loader:
+            x_f = x_f.to(args.device) if args is not None else x_f.cuda()
+            y_f = y_f.to(args.device) if args is not None else y_f.cuda()
+            if y_f.ndim == 2:  # safety: one-hot -> indices
+                y_f = y_f.argmax(dim=1)
+
+            # ---- FORGET: maximize CE (gradient ascent) ----
+            _, logits_y_f, xhat_f, mu_f, logvar_f = vib(x_f, mode="with_reconstruction")
+            ce_f = loss_fn(logits_y_f, y_f)
+
+            if include_recon_kld:
+                xhat_f = xhat_f.view(xhat_f.size(0), -1)
+                xf_flat = x_f.view(x_f.size(0), -1)
+                recon_f = reconstruction_function(xhat_f, xf_flat)
+                kld_f = _kld_mean_standard_normal(mu_f, logvar_f)
+                forget_obj = ce_f + (args.beta if args is not None else 0.0) * kld_f + recon_f
+            else:
+                forget_obj = ce_f
+
+            # ---- RETAIN: minimize CE (optional) ----
+            retain_obj = 0.0
+            ce_r = torch.tensor(0.0, device=x_f.device)
+            if retain_iter is not None and retain_w != 0:
+                x_r, y_r = next(retain_iter)
+                x_r = x_r.to(x_f.device)
+                y_r = y_r.to(x_f.device)
+                if y_r.ndim == 2:
+                    y_r = y_r.argmax(dim=1)
+
+                _, logits_y_r, xhat_r, mu_r, logvar_r = vib(x_r, mode="with_reconstruction")
+                ce_r = loss_fn(logits_y_r, y_r)
+
+                if include_recon_kld:
+                    xhat_r = xhat_r.view(xhat_r.size(0), -1)
+                    xr_flat = x_r.view(x_r.size(0), -1)
+                    recon_r = reconstruction_function(xhat_r, xr_flat)
+                    kld_r = _kld_mean_standard_normal(mu_r, logvar_r)
+                    retain_obj = ce_r + (args.beta if args is not None else 0.0) * kld_r + recon_r
+                else:
+                    retain_obj = ce_r
+
+            # ---- PARAM REG (optional) ----
+            reg = torch.tensor(0.0, device=x_f.device)
+            if reg_w > 0:
+                ref_i = 0
+                for p in vib.parameters():
+                    if not p.requires_grad:
+                        continue
+                    reg = reg + (p - ref_params[ref_i]).pow(2).mean()
+                    ref_i += 1
+
+            # FINAL: minimize( -forget + retain + reg )
+            loss = (-forget_w * forget_obj) + (retain_w * retain_obj) + (reg_w * reg)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(vib.parameters(), grad_clip)
+            opt.step()
+
+            # logging
+            running["ce_f"] += ce_f.item()
+            running["ce_r"] += float(ce_r.item()) if isinstance(ce_r, torch.Tensor) else float(ce_r)
+            running["reg"] += reg.item() if isinstance(reg, torch.Tensor) else float(reg)
+            running["loss"] += loss.item()
+            n += 1
+            step += 1
+
+            if print_every and (step % print_every == 0):
+                print(
+                    f"[GA-unl ep {ep+1}/{epochs} step {step}] "
+                    f"CE_forget={running['ce_f']/n:.4f}  "
+                    f"CE_retain={running['ce_r']/n:.4f}  "
+                    f"reg={running['reg']/n:.6f}  "
+                    f"loss={running['loss']/n:.4f}"
+                )
+
+            if max_steps is not None and step >= max_steps:
+                break
+
+        # end epoch print
+        if n > 0:
+            print(
+                f"[GA-unl ep {ep+1}/{epochs}] "
+                f"CE_forget={running['ce_f']/n:.4f}  "
+                f"CE_retain={running['ce_r']/n:.4f}  "
+                f"reg={running['reg']/n:.6f}  "
+                f"loss={running['loss']/n:.4f}"
+            )
+
+        if max_steps is not None and step >= max_steps:
+            break
+
+    return vib
 
 
 class TransformSubset(Subset):
@@ -1990,7 +2156,7 @@ elif args.dataset == 'CelebA':
 
 
 
-train_loader = DataLoader(multi_view_dataset, batch_size=args.batch_size, shuffle=True)
+train_loader = DataLoader(original_train_set, batch_size=args.batch_size, shuffle=True)
 original_train_loader = DataLoader(original_train_set, batch_size=args.batch_size, shuffle=False)
 test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=True )
 
@@ -2046,7 +2212,7 @@ train_type = args.train_type
 start_time = time.time()
 for epoch in range(args.num_epochs):
     vib.train()
-    vib = vib_train(remaining_loader, vib, loss_fn, reconstruction_function, args, epoch, train_type)  # dataloader_total, dataloader_w_o_twin
+    vib = vib_train(train_loader, vib, loss_fn, reconstruction_function, args, epoch, train_type)  # dataloader_total, dataloader_w_o_twin
 
 
 print('acc list', clean_acc_list)
@@ -2084,40 +2250,62 @@ infer_acc = membership_inf_results(infer_model, vib_for_infer, unl_infer_data_lo
 # train_loader
 
 
-@torch.no_grad()
-def collect_z(loader, vib, device, n_samples, is_multiview=False, view_idx=0, normalize=True):
-    vib.eval()
-    zs, ys = [], []
-    seen = 0
 
-    for batch in loader:
-        if is_multiview:
-            # train_loader (MultiViewMNIST): x_list is length k, each is [B,1,28,28]
-            x_list, y_list = batch
-            x = x_list[view_idx].to(device)
-            y = y_list[view_idx].to(device)
-        else:
-            # unlearning_loader: (x, y)
-            x, y = batch
-            x, y = x.to(device), y.to(device)
 
-        z, *_ = vib(x, mode='with_reconstruction')   # z == logits_z  (B, dimZ)
-        if normalize:
-            z = F.normalize(z, p=2, dim=1)
 
-        take = min(n_samples - seen, z.size(0))
-        zs.append(z[:take].cpu())
-        ys.append(y[:take].cpu())
-        seen += take
+# unlearning
 
-        if seen >= n_samples:
-            break
 
-    return torch.cat(zs, dim=0), torch.cat(ys, dim=0)
+#unlearning_loader_with_c_p = prepare_centroid_and_positive(vib, unlearning_loader, remaining_loader, args)
+
+unlearning_with_new_center, top_k_nearest_loader = create_unlearning_with_topk_loader(vib, unlearning_loader, remaining_loader, args, top_k=5, shuffle=True)
+# record time for unlearning
+
+start_time = time.time()
+vib_unlearnined = copy.deepcopy(vib)
+
+#vib_unlearnined = triplet_contrastive_unlearning(vib_unlearnined, unlearning_loader, remaining_loader, args.margin, args.unl_epochs, loss_fn, args)
+
+# vib_unlearnined = copy.deepcopy(vib)
+
+vib_unlearnined = gradient_ascent_unl(
+    copy.deepcopy(vib),
+    forget_loader=unlearning_loader,
+    retain_loader=None,
+    args=args,
+    loss_fn=loss_fn,
+    reconstruction_function=reconstruction_function,
+    epochs=args.unl_epochs,
+    lr=args.lr,
+    forget_w=1.0,
+    retain_w=0.0,
+)
+
+print("Unlearning completed.")
+
+end_time = time.time()
+running_time = end_time - start_time
+print(f'unlearning with dp {running_time} seconds')
+
+
+# calculate berfore unlearning
+infer_acc = membership_inf_results(infer_model, vib_unlearnined, unl_infer_data_loader, "after unl")
+
+
+vib_unlearnined.eval()
+acc_t = eva_vib(vib_unlearnined, test_loader, args, name='on test dataset after unlearning', epoch=999)
+acc_r = eva_vib(vib_unlearnined, original_train_loader, args, name='on the remaining training after unlearning', epoch=999)
+acc_ua = eva_vib(vib_unlearnined, unlearning_loader, args, name='on the unlearning data after unlearning', epoch=999)
+print("acc_ua:", 1 - acc_ua)
+
+
+
+
+
 
 # 1) collect representations
-z_unl, y_unl = collect_z(unlearning_loader, vib, args.device, n_samples=200,  is_multiview=False)
-z_trn, y_trn = collect_z(remaining_loader,     vib, args.device, n_samples=4000, is_multiview=True, view_idx=0)
+z_unl, y_unl = collect_z(unlearning_loader, vib_unlearnined, args.device, n_samples=200,  is_multiview=False)
+z_trn, y_trn = collect_z(remaining_loader,     vib_unlearnined, args.device, n_samples=4000, is_multiview=False, view_idx=0)
 
 # 2) t-SNE
 Z = torch.cat([z_trn, z_unl], dim=0).numpy()
@@ -2165,54 +2353,13 @@ ax.scatter(
 
 ax.legend(loc="best", frameon=True)
 cb = fig.colorbar(ax.collections[-1], ax=ax, ticks=np.arange(10))  # attach to last scatter
-ax.set_title("Retrain - Random Unlearning: 10%")
+ax.set_title("Gradient Ascent - Random Unlearning: 10%")
 
 fig.tight_layout()
 
 # SAVE FIRST
-fig.savefig("Retrain_random_forgetting10p.pdf", dpi=300, bbox_inches="tight")
+fig.savefig("GA_random_forgetting10p.pdf", dpi=300, bbox_inches="tight")
 #fig.savefig("Retrain_random_forgetting10p.png", dpi=300, bbox_inches="tight")  # optional
 
 plt.show()
 plt.close(fig)  # optional, frees memory
-
-
-
-
-# unlearning
-
-
-""""
-#unlearning_loader_with_c_p = prepare_centroid_and_positive(vib, unlearning_loader, remaining_loader, args)
-
-unlearning_with_new_center, top_k_nearest_loader = create_unlearning_with_topk_loader(vib, unlearning_loader, remaining_loader, args, top_k=5, shuffle=True)
-# record time for unlearning
-
-start_time = time.time()
-vib_unlearnined = copy.deepcopy(vib)
-
-#vib_unlearnined = triplet_contrastive_unlearning(vib_unlearnined, unlearning_loader, remaining_loader, args.margin, args.unl_epochs, loss_fn, args)
-
-vib_unlearnined = unlearning_with_topk(vib_unlearnined, unlearning_with_new_center, top_k_nearest_loader, loss_fn, reconstruction_function, args)
-
-print("Unlearning completed.")
-
-end_time = time.time()
-running_time = end_time - start_time
-print(f'unlearning with dp {running_time} seconds')
-
-
-# calculate berfore unlearning
-infer_acc = membership_inf_results(infer_model, vib_unlearnined, unl_infer_data_loader, "after unl")
-
-
-vib_unlearnined.eval()
-acc_t = eva_vib(vib_unlearnined, test_loader, args, name='on test dataset after unlearning', epoch=999)
-acc_r = eva_vib(vib_unlearnined, original_train_loader, args, name='on the remaining training after unlearning', epoch=999)
-acc_ua = eva_vib(vib_unlearnined, unlearning_loader, args, name='on the unlearning data after unlearning', epoch=999)
-print("acc_ua:", 1 - acc_ua)
-"""
-
-
-
-

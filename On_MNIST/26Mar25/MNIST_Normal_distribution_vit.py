@@ -18,7 +18,6 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap, BoundaryNorm
 import numpy as np
 from torch.utils.data import DataLoader, Dataset, Subset
 import copy
@@ -725,8 +724,8 @@ def init_vib(args):
         if args.model == 'S-VAE':
             encoder = resnet18(1, args.dimZ)  # 64QAM needs 6 bits
         else:
-            # encoder = make_vit_b_28x28_patch4_1ch(out_dim=args.dimZ*2)
-            encoder = resnet18(1, args.dimZ*2)  # 64QAM needs 6 bits
+            encoder = make_vit_b_28x28_patch4_1ch(out_dim=args.dimZ*2)
+            # encoder = resnet18(1, args.dimZ*2)  # 64QAM needs 6 bits
         lr = args.lr
 
     elif args.dataset == 'CIFAR10':
@@ -814,9 +813,9 @@ def vib_train(dataset, model, loss_fn, reconstruction_function, args, epoch, tra
         U, S, V = torch.svd(C)  # or torch.linalg.svd(C), depending on PyTorch version
         nuclear_norm = S.sum()
 
-        # nuclear_norm = maximum_manifold_capacity(logits_z, gamma=0) + BCE
+        # nuclear_norm = maximum_manifold_capacity(logits_z, gamma=0) + BCE + BCE
 
-        loss = args.beta * KLD_mean + BCE + H_p_q - args.mcr_rate * nuclear_norm #  + H_p_q + H_p_q - nuclear_norm  + H_p_q + H_p_q + nuclear_norm
+        loss = args.beta * KLD_mean  + H_p_q - args.mcr_rate * nuclear_norm #  + H_p_q + H_p_q - nuclear_norm  + H_p_q + H_p_q + nuclear_norm
 
         optimizer.zero_grad()
         loss.backward()
@@ -894,7 +893,7 @@ def prepare_unl(erasing_dataset, dataloader_remaining_after_aux, model, loss_fn,
             KLD_mean2 = torch.mean(KLD_element2).mul_(-0.5).to(args.device)
 
             loss = args.unlearn_learning_rate * (args.beta * KLD_mean - H_p_q) + args.self_sharing_rate * (
-                        args.beta * KLD_mean2 + H_p_q2)
+                        args.beta * KLD_mean2 + H_p_q2)  # args.beta * KLD_mean - H_p_q + args.beta * KLD_mean2  + H_p_q2 #- log_z / e_log_py #-   # H_p_q + args.beta * KLD_mean2
 
             optimizer.zero_grad()
             loss.backward()
@@ -1917,7 +1916,7 @@ args.unlearn_learning_rate = 0.1
 args.ep_distance = 20
 args.dimZ =  32 #10 /2  # 40 # 2
 args.batch_size = 16
-args.unlearning_size = 400
+args.unlearning_size = 200
 args.erased_local_r = 0.02
 args.construct_size = 0.02
 # args.auxiliary_size = 0.01
@@ -2046,7 +2045,7 @@ train_type = args.train_type
 start_time = time.time()
 for epoch in range(args.num_epochs):
     vib.train()
-    vib = vib_train(remaining_loader, vib, loss_fn, reconstruction_function, args, epoch, train_type)  # dataloader_total, dataloader_w_o_twin
+    vib = vib_train(train_loader, vib, loss_fn, reconstruction_function, args, epoch, train_type)  # dataloader_total, dataloader_w_o_twin
 
 
 print('acc list', clean_acc_list)
@@ -2068,6 +2067,7 @@ acc_t = eva_vib(vib, test_loader, args, name='on test dataset before unlearning'
 acc_r = eva_vib(vib, original_train_loader, args, name='on the remaining training before unlearning', epoch=999)
 
 
+
 acc_ua = eva_vib(vib, unlearning_loader, args, name='on the unlearning data before unlearning', epoch=999)
 print("acc_ua:", 1 - acc_ua)
 
@@ -2079,110 +2079,9 @@ infer_acc = membership_inf_results(infer_model, vib_for_infer, unl_infer_data_lo
 
 
 
-# unlearning_loader
-
-# train_loader
-
-
-@torch.no_grad()
-def collect_z(loader, vib, device, n_samples, is_multiview=False, view_idx=0, normalize=True):
-    vib.eval()
-    zs, ys = [], []
-    seen = 0
-
-    for batch in loader:
-        if is_multiview:
-            # train_loader (MultiViewMNIST): x_list is length k, each is [B,1,28,28]
-            x_list, y_list = batch
-            x = x_list[view_idx].to(device)
-            y = y_list[view_idx].to(device)
-        else:
-            # unlearning_loader: (x, y)
-            x, y = batch
-            x, y = x.to(device), y.to(device)
-
-        z, *_ = vib(x, mode='with_reconstruction')   # z == logits_z  (B, dimZ)
-        if normalize:
-            z = F.normalize(z, p=2, dim=1)
-
-        take = min(n_samples - seen, z.size(0))
-        zs.append(z[:take].cpu())
-        ys.append(y[:take].cpu())
-        seen += take
-
-        if seen >= n_samples:
-            break
-
-    return torch.cat(zs, dim=0), torch.cat(ys, dim=0)
-
-# 1) collect representations
-z_unl, y_unl = collect_z(unlearning_loader, vib, args.device, n_samples=200,  is_multiview=False)
-z_trn, y_trn = collect_z(remaining_loader,     vib, args.device, n_samples=4000, is_multiview=True, view_idx=0)
-
-# 2) t-SNE
-Z = torch.cat([z_trn, z_unl], dim=0).numpy()
-group = np.array([0] * len(z_trn) + [1] * len(z_unl))  # 0=train, 1=unlearning
-labels = torch.cat([y_trn, y_unl], dim=0).numpy()
-
-tsne = TSNE(
-    n_components=2,
-    perplexity=30,
-    init="pca",
-    learning_rate="auto",
-    random_state=0,
-)
-Z2 = tsne.fit_transform(Z)
-
-# 3) plot: train vs unlearning
-
-# tab10 in the exact order shown: 0..9
-cmap = ListedColormap(plt.cm.tab10.colors)
-bounds = np.arange(-0.5, 10.5, 1)          # [-0.5, 0.5, 1.5, ..., 9.5]
-norm = BoundaryNorm(bounds, cmap.N)
-
-fig, ax = plt.subplots(figsize=(7, 6))
-
-idx_tr = (group == 0)
-idx_un = (group == 1)
-
-ax.scatter(
-    Z2[idx_tr, 0], Z2[idx_tr, 1],
-    c=labels[idx_tr],
-    cmap=cmap, norm=norm,
-    s=6, alpha=0.35,
-    marker="o", linewidths=0,
-    label="Retrain"
-)
-
-ax.scatter(
-    Z2[idx_un, 0], Z2[idx_un, 1],
-    c=labels[idx_un],
-    cmap=cmap, norm=norm,
-    s=40, alpha=0.95,
-    marker="o", linewidths=0,
-    label="Unlearn"
-)
-
-ax.legend(loc="best", frameon=True)
-cb = fig.colorbar(ax.collections[-1], ax=ax, ticks=np.arange(10))  # attach to last scatter
-ax.set_title("Retrain - Random Unlearning: 10%")
-
-fig.tight_layout()
-
-# SAVE FIRST
-fig.savefig("Retrain_random_forgetting10p.pdf", dpi=300, bbox_inches="tight")
-#fig.savefig("Retrain_random_forgetting10p.png", dpi=300, bbox_inches="tight")  # optional
-
-plt.show()
-plt.close(fig)  # optional, frees memory
-
-
-
 
 # unlearning
 
-
-""""
 #unlearning_loader_with_c_p = prepare_centroid_and_positive(vib, unlearning_loader, remaining_loader, args)
 
 unlearning_with_new_center, top_k_nearest_loader = create_unlearning_with_topk_loader(vib, unlearning_loader, remaining_loader, args, top_k=5, shuffle=True)
@@ -2211,7 +2110,7 @@ acc_t = eva_vib(vib_unlearnined, test_loader, args, name='on test dataset after 
 acc_r = eva_vib(vib_unlearnined, original_train_loader, args, name='on the remaining training after unlearning', epoch=999)
 acc_ua = eva_vib(vib_unlearnined, unlearning_loader, args, name='on the unlearning data after unlearning', epoch=999)
 print("acc_ua:", 1 - acc_ua)
-"""
+
 
 
 

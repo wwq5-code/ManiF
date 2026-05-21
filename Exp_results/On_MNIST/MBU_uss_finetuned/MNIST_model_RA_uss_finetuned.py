@@ -19,7 +19,7 @@ labels = ['200', '400', '600', '800', '1000', '1200']
 OUL_finetuned = [0.9961, 0.9945, 0.9951, 0.9951, 0.9955, 0.9950]
 
 # unl_hess_r = [96.6, 96.66, 96.04, 95.94, 95.85, 97.21]
-OUL = [0.9958, 0.9948, 0.9947, 0.9943, 0.9941, 0.9940]
+OUL = [0.9959, 0.9949, 0.9949, 0.9946, 0.9943, 0.9940]
 
 org_acc = [0.9965, 0.9965, 0.9965, 0.9965, 0.9965, 0.9965]
 
@@ -35,7 +35,7 @@ for i in range(len(OUL)):
     OUL_finetuned[i] = OUL_finetuned[i] * 100
 
 plt.style.use('seaborn')
-plt.figure(figsize=(5.5, 5.3))
+plt.figure(figsize=(6.5, 5.0))
 l_w=5
 m_s=15
 marker_s = 3
@@ -57,7 +57,7 @@ plt.plot(x, salun_acc, linestyle='-.', color='#B595BF',  marker='d', fillstyle='
 plt.plot(x, vbu_ldp_acc, linestyle='-.', color='#E1C855',  marker='^', fillstyle='full', markevery=markevery,
          label='VBU',linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
 
-plt.plot(x, OUL_finetuned, linestyle='-.', color='#E07E35',  marker='*', fillstyle='full', markevery=markevery, label='ManiF-SMC(FineTuned)',linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
+plt.plot(x, OUL_finetuned, linestyle='-', color='#ED9F9B',  marker='v', fillstyle='full', markevery=markevery, label='ManiF-SMC(FineTuned)',linewidth=l_w, markersize=m_s, markeredgewidth=marker_s)
 
 
 
